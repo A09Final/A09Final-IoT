@@ -2,6 +2,7 @@
 // - BME688 (I2C): suhu, kelembapan, tekanan, resistansi gas
 // - LD2410B (UART): ada / tidak ada orang
 // - HomeSpan: bridge HomeKit berisi 4 accessory (Temperature, Humidity, Air Quality, Human Presence)
+// - WiFi diatur lewat Bluetooth dari app iOS DapurSetup (SDK ESPProvision)
 //
 // Library (Library Manager):
 //   - "Adafruit BME680" (mendukung BME688)
@@ -10,22 +11,42 @@
 // Arduino IDE:
 //   Board            : "ESP32S3 Dev Module"
 //   USB CDC On Boot  : Enabled
-//   Partition Scheme : "Minimal SPIFFS (1.9MB APP)" atau "Huge APP" --- sketch HomeSpan
-//                      tidak muat di partisi default.
+//   Partition Scheme : "Huge APP (3MB No OTA)" --- HomeSpan + stack Bluetooth
+//                      tidak muat di partisi default
 //   Serial Monitor   : 115200 baud
+//
+// Keamanan pemasangan:
+//   PoP (PIN provisioning) diacak sekali saat boot pertama dan disimpan di NVS,
+//   jadi setiap board punya PIN sendiri -- tidak ada satu PIN untuk semua unit.
+//   PoP tidak ada di dalam app; app membacanya dari QR yang ditempel di board.
 //
 // Cara pakai pertama kali:
 //   1. Upload, buka Serial Monitor 115200.
-//   2. Set WiFi: ketik 'W' di Serial Monitor, atau sambungkan HP ke AP
-//      "A09-IoT-Setup" (password di HK_AP_PASSWORD) lalu isi lewat halaman web.
-//   3. Di app Home: Tambah Aksesori -> Masukkan Kode secara Manual -> 466-37-726.
-//   4. Ketik '?' di Serial Monitor untuk daftar perintah HomeSpan lainnya.
+//   2. Board mencetak PoP dan QR provisioning. Tempel QR itu di badan board.
+//   3. Di app DapurSetup: pindai QR, pilih WiFi, isi kata sandi.
+//   4. Board menyala ulang lalu muncul di Apple Home. Kode pairing 466-37-726.
+//
+// Perintah Serial Monitor (diawali @):
+//   @Q  tampilkan PoP + QR provisioning
+//   @R  buat PoP baru (QR lama jadi tidak berlaku)
+//   Bawaan HomeSpan: ? bantuan | A provisioning ulang | X hapus WiFi | U hapus pairing
 
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include "Adafruit_BME680.h"
 #include "HomeSpan.h"
+#include "WiFi.h"
+#include "WiFiProv.h"
+#include <Preferences.h>
+
+// Generator QR bawaan ESP-IDF, dipakai untuk mencetak QR ke Serial Monitor.
+#if __has_include("qrcode.h")
+  #include "qrcode.h"
+  #define ADA_QRCODE 1
+#else
+  #warning "qrcode.h tidak ada: QR hanya dicetak sebagai teks"
+#endif
 
 // ---------- Pin ----------
 #define I2C_SDA     8      // BME688 SDA
@@ -44,8 +65,13 @@
 #define HK_MODEL         "ESP32-S3 BME688 LD2410B"
 #define HK_PAIRING_CODE  "46637726"       // tampil di Home app sebagai 466-37-726
 #define HK_SETUP_ID      "A09F"
-#define HK_AP_SSID       "A09-IoT-Setup"
-#define HK_AP_PASSWORD   "homespan"
+// ---------- Provisioning WiFi lewat BLE ----------
+// Protokol provisioning Espressif, berpasangan dengan app iOS DapurSetup.
+// PoP tidak ditulis di sini: diacak per board dan disimpan di NVS, lalu
+// disampaikan ke app lewat QR yang ditempel di badan perangkat.
+#define PROV_PREFIX   "DAPUR_"      // nama BLE jadi DAPUR_xxxxxx (6 digit MAC)
+#define PROV_NVS      "a09prov"     // ruang NVS tempat PoP disimpan
+const unsigned long PROV_TIMEOUT = 300000;   // 5 menit menunggu app
 
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
   #define LED_WRITE(r, g, b) rgbLedWrite(LED_PIN, r, g, b)
@@ -221,6 +247,156 @@ void updateBME() {
 }
 
 // =====================================================
+// Provisioning WiFi lewat BLE
+// Dipasang ke HomeSpan lewat setApFunction(), jadi fungsi ini jalan saat
+// kredensial WiFi belum ada, atau saat kamu ketik 'A' di Serial Monitor.
+// =====================================================
+static volatile bool provSukses = false;
+static char provSsid[33];
+static char provPwd[65];
+static char provPop[9]  = "";      // 8 karakter, unik per board
+static char namaBLE[16] = "";      // DAPUR_xxxxxx
+
+void susunNamaBLE() {
+  snprintf(namaBLE, sizeof(namaBLE), "%s%06X", PROV_PREFIX,
+           (uint32_t)(ESP.getEfuseMac() & 0xFFFFFF));
+}
+
+// PoP dibuat sekali saat boot pertama lalu disimpan permanen di NVS.
+// Kamus sengaja tanpa 0/O/1/l/I supaya tidak salah baca kalau ditulis tangan.
+void muatAtauBuatPop(bool paksaBaru) {
+  static const char kamus[] = "abcdefghijkmnpqrstuvwxyz23456789";   // 32 karakter
+
+  Preferences pref;
+  pref.begin(PROV_NVS, false);
+  String tersimpan = pref.getString("pop", "");
+
+  if (paksaBaru || tersimpan.length() != 8) {
+    char baru[9];
+    for (int i = 0; i < 8; i++)
+      baru[i] = kamus[esp_random() % (sizeof(kamus) - 1)];
+    baru[8] = '\0';
+    pref.putString("pop", baru);
+    tersimpan = baru;
+    Serial.println("[PROV] PoP baru dibuat untuk board ini.");
+  }
+  pref.end();
+
+  strlcpy(provPop, tersimpan.c_str(), sizeof(provPop));
+}
+
+#ifdef ADA_QRCODE
+// QR digambar dengan blok setengah supaya satu baris teks memuat dua baris modul.
+static void gambarQR(esp_qrcode_handle_t qr) {
+  static const char *BLOK[] = {
+    "  ", "\u2580 ", " \u2580", "\u2580\u2580", "\u2584 ", "\u2588 ", "\u2584\u2580", "\u2588\u2580",
+    " \u2584", "\u2580\u2584", " \u2588", "\u2580\u2588", "\u2584\u2584", "\u2588\u2584", "\u2584\u2588", "\u2588\u2588",
+  };
+  int ukuran = esp_qrcode_get_size(qr), tepi = 2;
+  for (int y = -tepi; y < ukuran + tepi; y += 2) {
+    for (int x = -tepi; x < ukuran + tepi; x += 2) {
+      int n = 0;
+      if (esp_qrcode_get_module(qr, x,     y))     n |= 1;
+      if (esp_qrcode_get_module(qr, x + 1, y))     n |= 2;
+      if (esp_qrcode_get_module(qr, x,     y + 1)) n |= 4;
+      if (esp_qrcode_get_module(qr, x + 1, y + 1)) n |= 8;
+      Serial.print(BLOK[n]);
+    }
+    Serial.print("\n");
+  }
+  Serial.print("\n");
+}
+#endif
+
+// Format JSON ini yang dibaca scanQRCode() di SDK ESPProvision.
+void cetakQrProvisioning() {
+  char isi[128];
+  // "security":1 wajib ada. Tanpa kunci itu SDK iOS menganggap Security 2,
+  // sementara firmware ini memakai Security 1, dan pemasangan akan gagal.
+  snprintf(isi, sizeof(isi),
+           "{\"ver\":\"v1\",\"name\":\"%s\",\"pop\":\"%s\","
+           "\"transport\":\"ble\",\"security\":1}",
+           namaBLE, provPop);
+
+  Serial.printf("\n[PROV] Nama Bluetooth : %s\n", namaBLE);
+  Serial.printf("[PROV] PoP            : %s\n", provPop);
+  Serial.printf("[PROV] Isi QR         : %s\n\n", isi);
+
+#ifdef ADA_QRCODE
+  esp_qrcode_config_t cfg = ESP_QRCODE_CONFIG_DEFAULT();
+  cfg.display_func = gambarQR;
+  esp_qrcode_generate(&cfg, isi);
+  Serial.println("[PROV] Pindai QR di atas dari app DapurSetup, atau cetak dan tempel di board.");
+#else
+  Serial.println("[PROV] Salin teks \"Isi QR\" di atas ke pembuat QR mana pun, lalu tempel di board.");
+#endif
+}
+
+// Dipanggil dari task FreeRTOS lain, bukan dari loop().
+void provEvent(arduino_event_t *e) {
+  switch (e->event_id) {
+    case ARDUINO_EVENT_PROV_START:
+      Serial.println("[PROV] Bluetooth aktif, menunggu app...");
+      break;
+    case ARDUINO_EVENT_PROV_CRED_RECV:
+      memcpy(provSsid, e->event_info.prov_cred_recv.ssid, 32);      provSsid[32] = 0;
+      memcpy(provPwd,  e->event_info.prov_cred_recv.password, 64);  provPwd[64]  = 0;
+      Serial.printf("[PROV] WiFi diterima: %s, mencoba tersambung...\n", provSsid);
+      break;
+    case ARDUINO_EVENT_PROV_CRED_FAIL:
+      Serial.println("[PROV] Gagal tersambung. Periksa kata sandi, kirim ulang dari app.");
+      break;
+    case ARDUINO_EVENT_PROV_CRED_SUCCESS:
+      Serial.println("[PROV] WiFi tersambung");
+      provSukses = true;
+      break;
+    default:
+      break;
+  }
+}
+
+void bleProvisioning() {
+  Serial.println("\n[PROV] Kredensial WiFi belum ada. Mulai provisioning lewat BLE.");
+  LED_WRITE(30, 0, 30);              // ungu = menunggu provisioning
+  cetakQrProvisioning();
+
+  WiFi.onEvent(provEvent);
+
+  // FREE_BTDM melepas memori Bluetooth begitu provisioning selesai.
+  WiFiProv.beginProvision(NETWORK_PROV_SCHEME_BLE,
+                          NETWORK_PROV_SCHEME_HANDLER_FREE_BTDM,
+                          NETWORK_PROV_SECURITY_1,
+                          provPop, namaBLE, NULL, NULL, true);
+
+  unsigned long mulai = millis();
+  while (!provSukses && millis() - mulai < PROV_TIMEOUT)
+    delay(100);
+
+  if (provSukses) {
+    homeSpan.setWifiCredentials(provSsid, provPwd);
+    LED_WRITE(0, 30, 0);
+    Serial.printf("[PROV] Tersimpan untuk \"%s\". Restart...\n", provSsid);
+  } else {
+    LED_WRITE(0, 0, 0);
+    Serial.println("[PROV] Waktu habis, tidak ada app yang menghubungi. Restart...");
+  }
+
+  delay(5000);                       // beri waktu app menerima status berhasil
+  ESP.restart();
+}
+
+// ---------- Perintah Serial Monitor ----------
+void cmdTampilQR(const char *buf) {
+  cetakQrProvisioning();
+}
+
+void cmdPopBaru(const char *buf) {
+  muatAtauBuatPop(true);
+  Serial.println("[PROV] QR lama tidak berlaku lagi. Cetak ulang yang di bawah ini.");
+  cetakQrProvisioning();
+}
+
+// =====================================================
 // HomeKit: bridge + 4 accessory supaya tiap sensor punya tile sendiri di Home app
 // =====================================================
 void newAccessoryInfo(const char *name, const char *serial) {
@@ -237,12 +413,14 @@ void newAccessoryInfo(const char *name, const char *serial) {
 void setupHomeKit() {
   homeSpan.setPairingCode(HK_PAIRING_CODE);
   homeSpan.setQRID(HK_SETUP_ID);
-  homeSpan.setApSSID(HK_AP_SSID);
-  homeSpan.setApPassword(HK_AP_PASSWORD);
-  homeSpan.enableAutoStartAP();          // buka AP setup kalau WiFi belum diset
+  homeSpan.setApFunction(bleProvisioning);  // WiFi lewat BLE, bukan Access Point
+  homeSpan.enableAutoStartAP();            // jalankan saat kredensial WiFi belum ada
   homeSpan.setLogLevel(1);
 
   homeSpan.begin(Category::Bridges, HK_NAME, HK_HOSTNAME, HK_MODEL);
+
+  new SpanUserCommand('Q', "- tampilkan PoP + QR provisioning", cmdTampilQR);
+  new SpanUserCommand('R', "- buat PoP baru (QR lama tidak berlaku)", cmdPopBaru);
 
   // Accessory 0: bridge itu sendiri
   newAccessoryInfo(HK_NAME, "A09-BRIDGE");
@@ -302,6 +480,11 @@ void setup() {
     // Tetap jalan dengan radar saja
     Serial.println("[BME688] Tidak ditemukan! Cek alamat I2C dan kabel SDA/SCL. Lanjut dengan radar saja.");
   }
+
+  // Identitas provisioning disiapkan sebelum HomeSpan, karena setApFunction()
+  // bisa langsung dipanggil saat kredensial WiFi belum ada.
+  susunNamaBLE();
+  muatAtauBuatPop(false);
 
   setupHomeKit();
 }

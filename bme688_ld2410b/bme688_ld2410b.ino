@@ -39,7 +39,7 @@
 #define LED_PIN     21     // LED RGB onboard
 
 // ---------- HomeKit ----------
-#define HK_NAME          "A09 Final IoT"
+#define HK_NAME          "Masterpiece-A09"
 #define HK_HOSTNAME      "a09-iot"
 #define HK_MODEL         "ESP32-S3 BME688 LD2410B"
 #define HK_PAIRING_CODE  "46637726"       // tampil di Home app sebagai 466-37-726

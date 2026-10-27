@@ -16,19 +16,23 @@
 //   Serial Monitor   : 115200 baud
 //
 // Keamanan pemasangan:
-//   PoP (PIN provisioning) diacak sekali saat boot pertama dan disimpan di NVS,
-//   jadi setiap board punya PIN sendiri -- tidak ada satu PIN untuk semua unit.
-//   PoP tidak ada di dalam app; app membacanya dari QR yang ditempel di board.
+//   PoP (PIN provisioning) dan kode pairing HomeKit sama-sama diacak saat boot
+//   pertama lalu disimpan di NVS, jadi tiap board punya miliknya sendiri --
+//   tidak ada satu nilai yang sama untuk semua unit. Keduanya tidak ada di
+//   dalam app; app membacanya dari stiker yang ditempel di badan perangkat.
 //
 // Cara pakai pertama kali:
 //   1. Upload, buka Serial Monitor 115200.
-//   2. Board mencetak PoP dan QR provisioning. Tempel QR itu di badan board.
+//   2. Board mencetak blok stiker: QR provisioning + kode pairing HomeKit.
+//      Cetak dan tempel di badan board.
 //   3. Di app DapurSetup: pindai QR, pilih WiFi, isi kata sandi.
-//   4. Board menyala ulang lalu muncul di Apple Home. Kode pairing 466-37-726.
+//   4. Board menyala ulang, lalu tambahkan di Apple Home memakai kode pairing
+//      yang tertera di stiker.
 //
 // Perintah Serial Monitor (diawali @):
-//   @Q  tampilkan PoP + QR provisioning
+//   @Q  cetak ulang stiker perangkat
 //   @R  buat PoP baru (QR lama jadi tidak berlaku)
+//   @C  buat kode HomeKit baru (perangkat perlu di-pair ulang)
 //   Bawaan HomeSpan: ? bantuan | A provisioning ulang | X hapus WiFi | U hapus pairing
 
 #include <Arduino.h>
@@ -63,7 +67,9 @@
 #define HK_NAME          "Masterpiece-A09"
 #define HK_HOSTNAME      "a09-iot"
 #define HK_MODEL         "ESP32-S3 BME688 LD2410B"
-#define HK_PAIRING_CODE  "46637726"       // tampil di Home app sebagai 466-37-726
+// Kode pairing HomeKit tidak ditulis di sini. Seperti PoP, kodenya diacak
+// per board saat boot pertama dan disimpan di NVS, lalu dicetak ke Serial
+// Monitor untuk ditempel di badan perangkat.
 #define HK_SETUP_ID      "A09F"
 // ---------- Provisioning WiFi lewat BLE ----------
 // Protokol provisioning Espressif, berpasangan dengan app iOS DapurSetup.
@@ -255,6 +261,7 @@ static volatile bool provSukses = false;
 static char provSsid[33];
 static char provPwd[65];
 static char provPop[9]  = "";      // 8 karakter, unik per board
+static char hkCode[9]   = "";      // 8 angka kode pairing HomeKit, unik per board
 static char namaBLE[16] = "";      // DAPUR_xxxxxx
 
 void susunNamaBLE() {
@@ -285,6 +292,44 @@ void muatAtauBuatPop(bool paksaBaru) {
   strlcpy(provPop, tersimpan.c_str(), sizeof(provPop));
 }
 
+// Apple menolak kode yang terlalu mudah ditebak. HomeSpan juga MENGHENTIKAN
+// sketch kalau setPairingCode() diberi kode tidak sah, jadi divalidasi dulu.
+bool kodeHkValid(const char *k) {
+  if (strlen(k) != 8) return false;
+  for (int i = 0; i < 8; i++)
+    if (k[i] < '0' || k[i] > '9') return false;
+
+  bool semuaSama = true;
+  for (int i = 1; i < 8; i++)
+    semuaSama &= (k[i] == k[0]);
+  if (semuaSama) return false;
+
+  return strcmp(k, "12345678") != 0 && strcmp(k, "87654321") != 0;
+}
+
+// Kode pairing HomeKit unik per board, disimpan di NVS kita sendiri karena
+// HomeSpan hanya menyimpan versi ter-hash dan tidak bisa mengembalikannya.
+void muatAtauBuatKodeHk(bool paksaBaru) {
+  Preferences pref;
+  pref.begin(PROV_NVS, false);
+  String tersimpan = pref.getString("hkcode", "");
+
+  if (paksaBaru || !kodeHkValid(tersimpan.c_str())) {
+    char baru[9];
+    do {
+      for (int i = 0; i < 8; i++)
+        baru[i] = '0' + (esp_random() % 10);
+      baru[8] = '\0';
+    } while (!kodeHkValid(baru));
+    pref.putString("hkcode", baru);
+    tersimpan = baru;
+    Serial.println("[HK] Kode pairing baru dibuat untuk board ini.");
+  }
+  pref.end();
+
+  strlcpy(hkCode, tersimpan.c_str(), sizeof(hkCode));
+}
+
 #ifdef ADA_QRCODE
 // QR digambar dengan blok setengah supaya satu baris teks memuat dua baris modul.
 static void gambarQR(esp_qrcode_handle_t qr) {
@@ -308,27 +353,42 @@ static void gambarQR(esp_qrcode_handle_t qr) {
 }
 #endif
 
-// Format JSON ini yang dibaca scanQRCode() di SDK ESPProvision.
-void cetakQrProvisioning() {
+// Satu blok siap cetak untuk ditempel di badan perangkat.
+// Hanya ADA SATU QR di sini, sengaja: QR provisioning wajib dipindai karena
+// PoP-nya acak, sedangkan kode HomeKit cukup diketik 8 angka lewat alur
+// standar Apple. Dua QR berdampingan hanya membuat pengguna salah pindai.
+void cetakStiker() {
+  // Format JSON ini yang dibaca scanQRCode() di SDK ESPProvision.
+  // "security":1 wajib: tanpa itu SDK iOS menganggap Security 2 dan gagal.
   char isi[128];
-  // "security":1 wajib ada. Tanpa kunci itu SDK iOS menganggap Security 2,
-  // sementara firmware ini memakai Security 1, dan pemasangan akan gagal.
   snprintf(isi, sizeof(isi),
            "{\"ver\":\"v1\",\"name\":\"%s\",\"pop\":\"%s\","
            "\"transport\":\"ble\",\"security\":1}",
            namaBLE, provPop);
 
-  Serial.printf("\n[PROV] Nama Bluetooth : %s\n", namaBLE);
-  Serial.printf("[PROV] PoP            : %s\n", provPop);
-  Serial.printf("[PROV] Isi QR         : %s\n\n", isi);
+  HapQR qr;
+  const char *payloadHk = qr.get(strtoul(hkCode, NULL, 10), HK_SETUP_ID,
+                                 2 /* Category::Bridges */);
+
+  Serial.println("\n======== STIKER PERANGKAT (cetak & tempel) ========");
+  Serial.printf("  Nama         : %s\n", HK_NAME);
+  Serial.printf("  Serial       : %s\n", namaBLE);
+  Serial.printf("  Kode HomeKit : %.3s-%.2s-%.3s\n", hkCode, hkCode + 3, hkCode + 5);
+  Serial.println();
 
 #ifdef ADA_QRCODE
   esp_qrcode_config_t cfg = ESP_QRCODE_CONFIG_DEFAULT();
   cfg.display_func = gambarQR;
   esp_qrcode_generate(&cfg, isi);
-  Serial.println("[PROV] Pindai QR di atas dari app DapurSetup, atau cetak dan tempel di board.");
-#else
-  Serial.println("[PROV] Salin teks \"Isi QR\" di atas ke pembuat QR mana pun, lalu tempel di board.");
+#endif
+
+  Serial.println("===================================================");
+  Serial.printf("  PoP          : %s\n", provPop);
+  Serial.printf("  Isi QR       : %s\n", isi);
+  Serial.printf("  Payload HK   : %s   (opsional, untuk QR HomeKit)\n", payloadHk);
+  Serial.println("===================================================\n");
+#ifndef ADA_QRCODE
+  Serial.println("[PROV] qrcode.h tidak tersedia: salin \"Isi QR\" ke pembuat QR mana pun.");
 #endif
 }
 
@@ -358,7 +418,7 @@ void provEvent(arduino_event_t *e) {
 void bleProvisioning() {
   Serial.println("\n[PROV] Kredensial WiFi belum ada. Mulai provisioning lewat BLE.");
   LED_WRITE(30, 0, 30);              // ungu = menunggu provisioning
-  cetakQrProvisioning();
+  cetakStiker();
 
   WiFi.onEvent(provEvent);
 
@@ -386,14 +446,21 @@ void bleProvisioning() {
 }
 
 // ---------- Perintah Serial Monitor ----------
-void cmdTampilQR(const char *buf) {
-  cetakQrProvisioning();
+void cmdTampilStiker(const char *buf) {
+  cetakStiker();
 }
 
 void cmdPopBaru(const char *buf) {
   muatAtauBuatPop(true);
-  Serial.println("[PROV] QR lama tidak berlaku lagi. Cetak ulang yang di bawah ini.");
-  cetakQrProvisioning();
+  Serial.println("[PROV] QR lama tidak berlaku lagi. Cetak ulang stiker di bawah.");
+  cetakStiker();
+}
+
+void cmdKodeHkBaru(const char *buf) {
+  muatAtauBuatKodeHk(true);
+  homeSpan.setPairingCode(hkCode);
+  Serial.println("[HK] Perangkat perlu di-pair ulang dengan kode baru di bawah.");
+  cetakStiker();
 }
 
 // =====================================================
@@ -411,7 +478,7 @@ void newAccessoryInfo(const char *name, const char *serial) {
 }
 
 void setupHomeKit() {
-  homeSpan.setPairingCode(HK_PAIRING_CODE);
+  homeSpan.setPairingCode(hkCode);          // diacak per board, lihat muatAtauBuatKodeHk()
   homeSpan.setQRID(HK_SETUP_ID);
   homeSpan.setApFunction(bleProvisioning);  // WiFi lewat BLE, bukan Access Point
   homeSpan.enableAutoStartAP();            // jalankan saat kredensial WiFi belum ada
@@ -419,8 +486,9 @@ void setupHomeKit() {
 
   homeSpan.begin(Category::Bridges, HK_NAME, HK_HOSTNAME, HK_MODEL);
 
-  new SpanUserCommand('Q', "- tampilkan PoP + QR provisioning", cmdTampilQR);
+  new SpanUserCommand('Q', "- cetak ulang stiker perangkat", cmdTampilStiker);
   new SpanUserCommand('R', "- buat PoP baru (QR lama tidak berlaku)", cmdPopBaru);
+  new SpanUserCommand('C', "- buat kode HomeKit baru (perlu pair ulang)", cmdKodeHkBaru);
 
   // Accessory 0: bridge itu sendiri
   newAccessoryInfo(HK_NAME, "A09-BRIDGE");
@@ -485,8 +553,10 @@ void setup() {
   // bisa langsung dipanggil saat kredensial WiFi belum ada.
   susunNamaBLE();
   muatAtauBuatPop(false);
+  muatAtauBuatKodeHk(false);
 
   setupHomeKit();
+  cetakStiker();
 }
 
 void loop() {

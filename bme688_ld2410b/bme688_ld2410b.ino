@@ -62,6 +62,18 @@
 #define LD_TX_PIN   43      // ESP32 TX  -> RX LD2410B
 #define LD_BAUD     256000
 
+// ---------- Jangkauan deteksi radar ----------
+// Radar menjangkau sampai ~6 m, jauh lebih luas dari yang kita perlukan.
+// Target di luar jangkauan ini diabaikan.
+//
+// Ambang masuk dan keluar sengaja dibedakan (histeresis). Angka jarak dari
+// radar bergetar beberapa sentimeter, jadi dengan satu ambang, orang yang
+// berdiri tepat di batas akan membuat status berkedip terus-menerus.
+// Di antara kedua angka ini, status dipertahankan apa adanya.
+#define RADAR_MASUK_CM    180   // lebih dekat dari ini -> ada orang
+#define RADAR_KELUAR_CM   220   // lebih jauh dari ini  -> tidak ada orang
+#define RADAR_ENERGI_MIN   20   // di bawah ini dianggap pantulan lemah, bukan orang
+
 #define LED_PIN     21     // LED RGB onboard
 
 // ---------- HomeKit ----------
@@ -117,6 +129,11 @@ volatile uint8_t bsecAkurasi = 0;       // 0 = belum stabil ... 3 = terkalibrasi
 volatile unsigned long bsecSimpanTerakhir = 0;   // 0 = belum pernah sejak boot
 
 int presence = -1;              // -1 = belum ada data, 0 = tidak ada, 1 = ada
+
+// Nilai mentah radar, sengaja tidak dihaluskan. Disediakan untuk lapisan
+// pengambil keputusan yang berjalan di board ini juga.
+uint16_t radarJarakCm = 0;      // jarak target terdekat yang sah
+uint8_t  radarEnergi  = 0;      // energi target tersebut
 unsigned long lastFrameMs = 0;
 bool radarWarned = false;
 
@@ -199,12 +216,36 @@ void updateRadar() {
     if (radarWarned && hkOccFault) hkOccFault->setVal(0);
     radarWarned = false;
 
-    // Status target: 0 = kosong, 1/2/3 = ada orang (bergerak, diam, atau keduanya)
-    int now = (data[2] != 0) ? 1 : 0;
+    // Jarak kedua jenis target selalu terisi, tetapi hanya sah kalau energinya
+    // di atas ambang -- saat tidak ada target bergerak, jarak geraknya tetap
+    // berisi angka sisa. Jadi energi yang menentukan, bukan jaraknya.
+    uint16_t jarakGerak  = data[3] | (data[4] << 8);
+    uint8_t  energiGerak = data[5];
+    uint16_t jarakDiam   = data[6] | (data[7] << 8);
+    uint8_t  energiDiam  = data[8];
+
+    bool     adaTarget = false;
+    uint16_t jarak     = 0;
+    uint8_t  energi    = 0;
+
+    if (energiGerak >= RADAR_ENERGI_MIN) {
+      adaTarget = true;  jarak = jarakGerak;  energi = energiGerak;
+    }
+    // Ambil yang terdekat kalau dua-duanya sah.
+    if (energiDiam >= RADAR_ENERGI_MIN && (!adaTarget || jarakDiam < jarak)) {
+      adaTarget = true;  jarak = jarakDiam;   energi = energiDiam;
+    }
+
+    radarJarakCm = adaTarget ? jarak : 0;
+    radarEnergi  = adaTarget ? energi : 0;
+
+    // Histeresis: di antara kedua ambang, keadaan sebelumnya dipertahankan.
+    int now = (presence == 1) ? 1 : 0;
+    if (!adaTarget)                    now = 0;
+    else if (jarak <= RADAR_MASUK_CM)  now = 1;
+    else if (jarak >= RADAR_KELUAR_CM) now = 0;
     if (now != presence) {
       presence = now;
-      Serial.printf("[%s] >>> %s\n", penandaWaktu(),
-                    presence ? "ADA ORANG" : "TIDAK ADA ORANG");
       LED_WRITE(0, 0, presence ? 40 : 0);   // LED biru saat ada orang
       if (hkOccupancy) hkOccupancy->setVal(presence);
     }
@@ -232,10 +273,17 @@ void updateRadar() {
 // Task ini hanya mengisi angka. Semua pemanggilan HomeKit tetap di loop(),
 // karena HomeSpan tidak aman dipanggil dari dua task sekaligus.
 // =====================================================
+// Dipakai di baris pembacaan berkala. Buffer statis, jadi hanya boleh
+// dipanggil dari loop() -- sama seperti penandaWaktu().
 const char* presenceText() {
-  if (presence == 1) return "ADA";
-  if (presence == 0) return "TIDAK ADA";
-  return "?";
+  static char buf[32];
+  if (presence == 1)
+    snprintf(buf, sizeof(buf), "ADA (%u cm, energi %u)", radarJarakCm, radarEnergi);
+  else if (presence == 0)
+    snprintf(buf, sizeof(buf), "TIDAK ADA");
+  else
+    snprintf(buf, sizeof(buf), "?");
+  return buf;
 }
 
 void setBmeFault(uint8_t fault) {

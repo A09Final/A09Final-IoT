@@ -34,6 +34,7 @@
 //   @Q  cetak ulang stiker perangkat
 //   @R  buat PoP baru (QR lama jadi tidak berlaku)
 //   @C  buat kode HomeKit baru (perangkat perlu di-pair ulang)
+//   @B  status BSEC: akurasi, IAQ, dan state kalibrasi di NVS
 //   Bawaan HomeSpan: ? bantuan | A provisioning ulang | X hapus WiFi | U hapus pairing
 
 #include <Arduino.h>
@@ -91,19 +92,29 @@ const unsigned long BSEC_SIMPAN_TIAP = 6UL * 60UL * 60UL * 1000UL;   // 6 jam
 
 // ---------- Objek ----------
 Bsec2 envSensor;
+
+// Konfigurasi BSEC: algoritma IAQ, suplai 3,3V, baca tiap 3 detik, kalibrasi
+// 4 hari. Wajib dimuat -- tanpa ini BSEC memakai interval bawaan yang berbeda
+// dan menolak langganan kita. Dipakai konfigurasi milik BME680 karena folder
+// bme688/ hanya berisi konfigurasi klasifikasi gas yang tidak menghasilkan IAQ.
+const uint8_t bsecConfig[] = {
+  #include "config/bme680/bme680_iaq_33v_3s_4d/bsec_iaq.txt"
+};
 HardwareSerial radar(1);
 
 // ---------- Status ----------
-// Diisi task BSEC, dibaca loop(). Akses 32-bit selaras bersifat atomik di
-// ESP32, jadi untuk sekumpulan angka seperti ini cukup tanpa mutex.
+// Diisi task BSEC, dibaca loop(). Baca-tulis 32-bit di ESP32 tidak bisa terpotong
+// di tengah, jadi untuk sekumpulan angka seperti ini tidak perlu mutex.
 volatile bool    bsecOk      = false;   // sensor berhasil diinisialisasi
 volatile bool    bsecAdaData = false;   // ada hasil baru yang belum dikirim
 volatile float   bsecSuhu    = 0;       // sudah dikompensasi panas heater
 volatile float   bsecLembap  = 0;
 volatile float   bsecTekanan = 0;       // hPa
+volatile bool    bsecStabil  = false;   // pemanasan awal sensor gas selesai
 volatile float   bsecIaq     = 0;       // Static IAQ, 0..500
 volatile float   bsecCo2     = 0;       // perkiraan eCO2, ppm
 volatile uint8_t bsecAkurasi = 0;       // 0 = belum stabil ... 3 = terkalibrasi
+volatile unsigned long bsecSimpanTerakhir = 0;   // 0 = belum pernah sejak boot
 
 int presence = -1;              // -1 = belum ada data, 0 = tidak ada, 1 = ada
 unsigned long lastFrameMs = 0;
@@ -119,6 +130,25 @@ Characteristic::AirQuality             *hkAir       = nullptr;
 Characteristic::StatusFault            *hkAirFault  = nullptr;
 Characteristic::OccupancyDetected      *hkOccupancy = nullptr;
 Characteristic::StatusFault            *hkOccFault  = nullptr;
+
+// Penanda waktu yang bentuknya mengikuti durasi, supaya tetap enak dibaca
+// setelah board menyala berjam-jam:  [3.1 s]  ->  [2:05]  ->  [1:23:45]
+// Memakai buffer statis, jadi hanya boleh dipanggil dari loop().
+const char* penandaWaktu() {
+  static char buf[16];
+  unsigned long ms = millis();
+  unsigned long detik = ms / 1000;
+
+  if (detik < 60)
+    snprintf(buf, sizeof(buf), "%.1f s", ms / 1000.0);
+  else if (detik < 3600)
+    snprintf(buf, sizeof(buf), "%lu:%02lu", detik / 60, detik % 60);
+  else
+    snprintf(buf, sizeof(buf), "%lu:%02lu:%02lu",
+             detik / 3600, (detik / 60) % 60, detik % 60);
+
+  return buf;
+}
 
 // =====================================================
 // LD2410B: parser frame
@@ -173,7 +203,7 @@ void updateRadar() {
     int now = (data[2] != 0) ? 1 : 0;
     if (now != presence) {
       presence = now;
-      Serial.printf("[%7.1f s] >>> %s\n", millis() / 1000.0,
+      Serial.printf("[%s] >>> %s\n", penandaWaktu(),
                     presence ? "ADA ORANG" : "TIDAK ADA ORANG");
       LED_WRITE(0, 0, presence ? 40 : 0);   // LED biru saat ada orang
       if (hkOccupancy) hkOccupancy->setVal(presence);
@@ -193,17 +223,14 @@ void updateRadar() {
 // =====================================================
 // BME688 lewat BSEC
 //
-// BSEC menuntut pembacaan di interval tetap (mode LP = 3 detik). loop() tidak
-// bisa menjaminnya karena homeSpan.poll() dapat menahan eksekusi beberapa detik
-// saat pairing. Karena itu BSEC dijalankan di task FreeRTOS sendiri.
+// BSEC harus membaca sensor tepat tiap 3 detik. loop() tidak bisa menjamin itu,
+// karena homeSpan.poll() kadang menahan eksekusi beberapa detik saat pairing.
+// Jadi BSEC dijalankan di task FreeRTOS sendiri, di Core 1 dengan prioritas 2 --
+// satu tingkat di atas loop() sehingga bisa menyelanya. Core 0 dihindari karena
+// di sana WiFi dan Bluetooth berjalan pada prioritas jauh lebih tinggi.
 //
-// Task dipasang di Core 1 dengan prioritas 2, satu tingkat di atas loopTask
-// (Core-1, Priority=1), sehingga menyela loop() begitu waktunya tiba. Core 0
-// sengaja dihindari karena di sana stack WiFi/BT berjalan pada prioritas jauh
-// lebih tinggi dan justru akan menunda task ini.
-//
-// Pembagian tugas: task hanya MEMPRODUKSI angka. Seluruh pemanggilan HomeKit
-// tetap di loop(), karena HomeSpan tidak dirancang thread-safe.
+// Task ini hanya mengisi angka. Semua pemanggilan HomeKit tetap di loop(),
+// karena HomeSpan tidak aman dipanggil dari dua task sekaligus.
 // =====================================================
 const char* presenceText() {
   if (presence == 1) return "ADA";
@@ -230,8 +257,7 @@ uint8_t iaqKeHomeKit(float iaq, uint8_t akurasi) {
 }
 
 // ---------- State kalibrasi di NVS ----------
-// Tanpa ini, tiap reboot mengulang kalibrasi dari nol dan akurasi tidak pernah
-// sempat mencapai 3 selama pengembangan.
+// Tanpa ini, tiap board dinyalakan ulang kalibrasi mulai dari nol lagi.
 static uint8_t bsecState[BSEC_MAX_STATE_BLOB_SIZE];
 
 bool muatStateBsec() {
@@ -257,15 +283,32 @@ bool simpanStateBsec() {
   pref.begin(BSEC_NVS, false);
   pref.putBytes("state", bsecState, BSEC_MAX_STATE_BLOB_SIZE);
   pref.end();
+  bsecSimpanTerakhir = millis();
   Serial.printf("[BSEC] State kalibrasi disimpan (akurasi %u).\n", bsecAkurasi);
   return true;
 }
 
-void cekStatusBsec() {
-  if (envSensor.status != BSEC_OK)
-    Serial.printf("[BSEC] status perpustakaan: %d\n", envSensor.status);
-  if (envSensor.sensor.status != BME68X_OK)
-    Serial.printf("[BSEC] status sensor BME68x: %d\n", envSensor.sensor.status);
+// Mencetak status BSEC, dan mengembalikan true hanya kalau ada error sungguhan.
+// BSEC memakai angka negatif untuk error dan positif untuk peringatan; peringatan
+// tidak boleh menghentikan apa pun karena sensornya tetap bekerja.
+bool adaErrorBsec() {
+  bool error = false;
+
+  if (envSensor.status < BSEC_OK) {
+    Serial.printf("[BSEC] ERROR library: %d\n", envSensor.status);
+    error = true;
+  } else if (envSensor.status > BSEC_OK) {
+    Serial.printf("[BSEC] peringatan library: %d\n", envSensor.status);
+  }
+
+  if (envSensor.sensor.status < BME68X_OK) {
+    Serial.printf("[BSEC] ERROR sensor BME68x: %d\n", envSensor.sensor.status);
+    error = true;
+  } else if (envSensor.sensor.status > BME68X_OK) {
+    Serial.printf("[BSEC] peringatan sensor BME68x: %d\n", envSensor.sensor.status);
+  }
+
+  return error;
 }
 
 // Dipanggil BSEC dari dalam task-nya sendiri setiap ada keluaran baru.
@@ -282,7 +325,12 @@ void bsecDataBaru(const bme68xData data, const bsecOutputs outputs, const Bsec2 
         bsecLembap = o.signal;
         break;
       case BSEC_OUTPUT_RAW_PRESSURE:
-        bsecTekanan = o.signal / 100.0f;     // Pa -> hPa
+        // Dokumentasi Bosch menyebut satuannya Pa, tapi yang benar-benar
+        // keluar sudah hPa (terukur ~1005). Jangan dibagi lagi.
+        bsecTekanan = o.signal;
+        break;
+      case BSEC_OUTPUT_RUN_IN_STATUS:
+        bsecStabil = (o.signal != 0);
         break;
       case BSEC_OUTPUT_STATIC_IAQ:           // lebih cocok untuk alat yang diam
         bsecIaq     = o.signal;
@@ -305,19 +353,26 @@ void tugasBsec(void *) {
     BSEC_OUTPUT_RAW_PRESSURE,
     BSEC_OUTPUT_STATIC_IAQ,
     BSEC_OUTPUT_CO2_EQUIVALENT,
+    BSEC_OUTPUT_RUN_IN_STATUS,
   };
 
   if (!envSensor.begin(BME_ADDR, Wire)) {
-    cekStatusBsec();
-    Serial.println("[BSEC] Sensor tidak ditemukan. Lanjut dengan radar saja.");
+    adaErrorBsec();
+    Serial.println("[BSEC] Sensor tidak ditemukan di I2C. Lanjut dengan radar saja.");
     vTaskDelete(NULL);
     return;
   }
 
-  if (!muatStateBsec()) cekStatusBsec();
+  if (!envSensor.setConfig(bsecConfig) && adaErrorBsec()) {
+    Serial.println("[BSEC] Konfigurasi ditolak. Lanjut dengan radar saja.");
+    vTaskDelete(NULL);
+    return;
+  }
 
-  if (!envSensor.updateSubscription(daftar, ARRAY_LEN(daftar), BSEC_SAMPLE_RATE_LP)) {
-    cekStatusBsec();
+  if (!muatStateBsec()) adaErrorBsec();
+
+  if (!envSensor.updateSubscription(daftar, ARRAY_LEN(daftar), BSEC_SAMPLE_RATE_LP)
+      && adaErrorBsec()) {
     Serial.println("[BSEC] Gagal berlangganan keluaran sensor.");
     vTaskDelete(NULL);
     return;
@@ -333,18 +388,17 @@ void tugasBsec(void *) {
   uint8_t       akurasiTerakhir = 0;
 
   for (;;) {
-    if (!envSensor.run()) cekStatusBsec();    // BSEC sendiri yang menjaga jadwal
+    if (!envSensor.run()) adaErrorBsec();    // BSEC sendiri yang menjaga jadwal
 
-    // Kalibrasi setengah jadi tetap layak disimpan: BSEC bisa melanjutkan dari
-    // sana, jauh lebih baik daripada mengulang dari nol setiap reboot. Selain
-    // berkala, state juga langsung disimpan tiap kali akurasi naik satu tingkat
-    // supaya kemajuan penting tidak menunggu jadwal berikutnya.
+    // Kalibrasi setengah jadi tetap disimpan -- BSEC bisa melanjutkan dari sana.
+    // Selain berkala, disimpan juga tiap kali akurasi naik, supaya kemajuan
+    // penting tidak menunggu jadwal berikutnya.
     bool akurasiNaik = bsecAkurasi > akurasiTerakhir;
     if (bsecAkurasi >= 1 &&
         (akurasiNaik || millis() - simpanTerakhir >= BSEC_SIMPAN_TIAP)) {
       akurasiTerakhir = bsecAkurasi;
       simpanTerakhir  = millis();
-      if (!simpanStateBsec()) cekStatusBsec();
+      if (!simpanStateBsec()) adaErrorBsec();
     }
 
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -361,9 +415,9 @@ void updateBME() {
   float   iaq     = bsecIaq;
   uint8_t akurasi = bsecAkurasi;
 
-  Serial.printf("[%7.1f s] Suhu: %.2f C | Lembap: %.2f %% | Tekanan: %.2f hPa | "
+  Serial.printf("[%s] Suhu: %.2f C | Lembap: %.2f %% | Tekanan: %.2f hPa | "
                 "IAQ: %.0f (akurasi %u) | eCO2: %.0f ppm | Orang: %s\n",
-                millis() / 1000.0, suhu, lembap, bsecTekanan,
+                penandaWaktu(), suhu, lembap, bsecTekanan,
                 iaq, akurasi, bsecCo2, presenceText());
 
   setBmeFault(0);
@@ -391,7 +445,7 @@ void susunNamaBLE() {
 }
 
 // PoP dibuat sekali saat boot pertama lalu disimpan permanen di NVS.
-// Kamus sengaja tanpa 0/O/1/l/I supaya tidak salah baca kalau ditulis tangan.
+// Karakter 0/O/1/l/I sengaja dibuang supaya tidak salah baca kalau ditulis tangan.
 void muatAtauBuatPop(bool paksaBaru) {
   static const char kamus[] = "abcdefghijkmnpqrstuvwxyz23456789";   // 32 karakter
 
@@ -413,8 +467,8 @@ void muatAtauBuatPop(bool paksaBaru) {
   strlcpy(provPop, tersimpan.c_str(), sizeof(provPop));
 }
 
-// Apple menolak kode yang terlalu mudah ditebak. HomeSpan juga MENGHENTIKAN
-// sketch kalau setPairingCode() diberi kode tidak sah, jadi divalidasi dulu.
+// Apple menolak kode yang terlalu mudah ditebak, dan HomeSpan menghentikan
+// sketch sepenuhnya kalau diberi kode tidak sah. Jadi diperiksa dulu.
 bool kodeHkValid(const char *k) {
   if (strlen(k) != 8) return false;
   for (int i = 0; i < 8; i++)
@@ -428,8 +482,8 @@ bool kodeHkValid(const char *k) {
   return strcmp(k, "12345678") != 0 && strcmp(k, "87654321") != 0;
 }
 
-// Kode pairing HomeKit unik per board, disimpan di NVS kita sendiri karena
-// HomeSpan hanya menyimpan versi ter-hash dan tidak bisa mengembalikannya.
+// Kode pairing HomeKit unik per board. Disimpan sendiri di NVS karena HomeSpan
+// hanya menyimpan bentuk teracaknya dan tidak bisa memberikan kodenya kembali.
 void muatAtauBuatKodeHk(bool paksaBaru) {
   Preferences pref;
   pref.begin(PROV_NVS, false);
@@ -474,10 +528,9 @@ static void gambarQR(esp_qrcode_handle_t qr) {
 }
 #endif
 
-// Satu blok siap cetak untuk ditempel di badan perangkat.
-// Hanya ADA SATU QR di sini, sengaja: QR provisioning wajib dipindai karena
-// PoP-nya acak, sedangkan kode HomeKit cukup diketik 8 angka lewat alur
-// standar Apple. Dua QR berdampingan hanya membuat pengguna salah pindai.
+// Blok siap cetak untuk ditempel di badan perangkat. Sengaja hanya memuat satu
+// QR: QR provisioning harus dipindai karena PoP-nya acak, sedangkan kode HomeKit
+// cukup diketik. Dua QR berdampingan hanya membuat orang salah pindai.
 void cetakStiker() {
   // Format JSON ini yang dibaca scanQRCode() di SDK ESPProvision.
   // "security":1 wajib: tanpa itu SDK iOS menganggap Security 2 dan gagal.
@@ -577,6 +630,34 @@ void cmdPopBaru(const char *buf) {
   cetakStiker();
 }
 
+// Ringkasan BSEC tanpa perlu menunggu boot atau mengorek log.
+void cmdStatusBsec(const char *buf) {
+  Preferences pref;
+  pref.begin(BSEC_NVS, true);
+  size_t n = pref.getBytesLength("state");
+  pref.end();
+
+  Serial.printf("\n[BSEC] sensor   : %s\n", bsecOk ? "siap" : "TIDAK AKTIF");
+  Serial.printf("[BSEC] akurasi  : %u  (0 belum stabil .. 3 terkalibrasi)\n", bsecAkurasi);
+  Serial.printf("[BSEC] pemanasan: %s\n", bsecStabil ? "selesai" : "masih berlangsung");
+  Serial.printf("[BSEC] IAQ      : %.0f  -> HomeKit AirQuality %u\n",
+                bsecIaq, iaqKeHomeKit(bsecIaq, bsecAkurasi));
+  Serial.printf("[BSEC] eCO2     : %.0f ppm\n", bsecCo2);
+  Serial.printf("[BSEC] suhu     : %.2f C | lembap %.2f %% | tekanan %.2f hPa\n",
+                bsecSuhu, bsecLembap, bsecTekanan);
+
+  if (n == 0)
+    Serial.println("[BSEC] state NVS: BELUM ADA (akurasi harus >= 1 dulu)");
+  else
+    Serial.printf("[BSEC] state NVS: ADA, %u byte\n", (unsigned)n);
+
+  if (bsecSimpanTerakhir == 0)
+    Serial.println("[BSEC] simpan    : belum pernah sejak boot ini\n");
+  else
+    Serial.printf("[BSEC] simpan    : %.1f menit lalu\n\n",
+                  (millis() - bsecSimpanTerakhir) / 60000.0);
+}
+
 void cmdKodeHkBaru(const char *buf) {
   muatAtauBuatKodeHk(true);
   homeSpan.setPairingCode(hkCode);
@@ -603,13 +684,14 @@ void setupHomeKit() {
   homeSpan.setQRID(HK_SETUP_ID);
   homeSpan.setApFunction(bleProvisioning);  // WiFi lewat BLE, bukan Access Point
   homeSpan.enableAutoStartAP();            // jalankan saat kredensial WiFi belum ada
-  homeSpan.setLogLevel(1);
+  homeSpan.setLogLevel(0);
 
   homeSpan.begin(Category::Bridges, HK_NAME, HK_HOSTNAME, HK_MODEL);
 
   new SpanUserCommand('Q', "- cetak ulang stiker perangkat", cmdTampilStiker);
   new SpanUserCommand('R', "- buat PoP baru (QR lama tidak berlaku)", cmdPopBaru);
   new SpanUserCommand('C', "- buat kode HomeKit baru (perlu pair ulang)", cmdKodeHkBaru);
+  new SpanUserCommand('B', "- status BSEC + state kalibrasi di NVS", cmdStatusBsec);
 
   // Accessory 0: bridge itu sendiri
   newAccessoryInfo(HK_NAME, "A09-BRIDGE");

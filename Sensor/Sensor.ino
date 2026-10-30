@@ -49,6 +49,8 @@
 #include "WiFi.h"
 #include "WiFiProv.h"
 #include <Preferences.h>
+//fuzzy logic
+#include "FuzzyKompor.h"
 
 // Generator QR bawaan ESP-IDF, dipakai untuk mencetak QR ke Serial Monitor.
 #if __has_include("qrcode.h")

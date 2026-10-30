@@ -37,6 +37,15 @@
 #define BW_VERSI      1
 #define BW_MINTA      1
 #define BW_JAWAB      2
+#define BW_KENDALI    3              // kendali alarm Sensor <-> Alarm
+
+// Token rahasia bersama yang menyaring paket kendali asing (paket nyasar atau
+// proyek ESP-NOW tetangga). Bukan pengaman kuat -- bisa dibaca dari firmware.
+// ponytail: token statis; naikkan ke kunci turunan dari ECDH pairing kalau
+// mematikan alarm dari jauh perlu dilindungi sungguhan.
+#define BW_TOKEN_LEN  8
+#define BW_DARI_SENSOR  0            // perintah nyala/mati untuk Alarm
+#define BW_DARI_ALARM   1            // laporan status dari Alarm (tombol fisik)
 
 #define BW_PUB_LEN    65             // titik P-256 tak terkompresi
 #define BW_NONCE_LEN  12
@@ -70,6 +79,24 @@ struct __attribute__((packed)) BwJawab {
 
 static_assert(sizeof(BwJawab) <= ESP_NOW_MAX_DATA_LEN, "JAWAB melebihi batas ESP-NOW");
 
+// Pesan kendali alarm, dua arah. Dari Sensor: perintah nyalakan/matikan alarm
+// (misalnya automation panas kompor di Home). Dari Alarm: laporan bahwa tombol
+// fisik mengubah status, supaya sakelar di Home ikut berubah.
+static const uint8_t BW_TOKEN[BW_TOKEN_LEN] = {
+  0xA0, 0x9A, 0x1A, 0x55, 0x3C, 0x7E, 0x11, 0x42
+};
+
+struct __attribute__((packed)) BwKendali {
+  uint32_t magic;
+  uint8_t  versi;
+  uint8_t  jenis;                    // BW_KENDALI
+  uint8_t  token[BW_TOKEN_LEN];
+  uint8_t  dari;                     // BW_DARI_SENSOR / BW_DARI_ALARM
+  uint8_t  nyala;                    // 0 = mati, 1 = nyala
+};
+
+static_assert(sizeof(BwKendali) <= ESP_NOW_MAX_DATA_LEN, "KENDALI melebihi batas ESP-NOW");
+
 // Callback terima ESP-NOW berganti bentuk di ESP-IDF 5 (core Arduino 3.x).
 #if ESP_IDF_VERSION_MAJOR >= 5
   #define BW_CB_TERIMA(nama) void nama(const esp_now_recv_info_t *info, const uint8_t *isi, int len)
@@ -88,6 +115,22 @@ static bool bwKepalaSah(const uint8_t *isi, int len, uint8_t jenis, size_t ukura
   if (len != (int)ukuran) return false;
   const BwMinta *k = (const BwMinta *)isi;   // tiga field pertama sama di kedua paket
   return k->magic == BW_MAGIC && k->versi == BW_VERSI && k->jenis == jenis;
+}
+
+static bool bwKendaliSah(const uint8_t *isi, int len, uint8_t dari) {
+  if (len != (int)sizeof(BwKendali)) return false;
+  const BwKendali *k = (const BwKendali *)isi;
+  return k->magic == BW_MAGIC && k->versi == BW_VERSI && k->jenis == BW_KENDALI &&
+         k->dari == dari && memcmp(k->token, BW_TOKEN, BW_TOKEN_LEN) == 0;
+}
+
+static void bwIsiKendali(BwKendali *k, uint8_t dari, bool nyala) {
+  k->magic = BW_MAGIC;
+  k->versi = BW_VERSI;
+  k->jenis = BW_KENDALI;
+  memcpy(k->token, BW_TOKEN, BW_TOKEN_LEN);
+  k->dari  = dari;
+  k->nyala = nyala ? 1 : 0;
 }
 
 // Membuat pasangan kunci baru. grp dan d harus sudah di-init pemanggil.

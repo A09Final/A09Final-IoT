@@ -3,8 +3,10 @@
 //   IAQ terkalibrasi beserta indikator akurasinya, dan perkiraan eCO2
 // - LD2410B (UART): ada / tidak ada orang
 // - MLX90640 (I2C): kamera thermal 32x24, dipakai memantau panas kompor
-// - HomeSpan: bridge HomeKit berisi 5 accessory (Temperature, Humidity, Air Quality,
-//   Human Presence, Stove Heat)
+// - HomeSpan: bridge HomeKit berisi 6 accessory (Temperature, Humidity, Air Quality,
+//   Human Presence, Stove Heat, Alarm). "Alarm" adalah sakelar yang merelai
+//   perintah nyala/mati ke board Alarm lewat ESP-NOW, jadi Alarm tidak perlu
+//   di-pair sendiri ke Home -- cukup satu kali setup di Sensor ini.
 // - WiFi diatur lewat Bluetooth dari app iOS DapurSetup (SDK ESPProvision),
 //   lalu diteruskan ke board Alarm lewat ESP-NOW (lihat BagiWifi.h)
 //
@@ -214,6 +216,7 @@ Characteristic::OccupancyDetected      *hkOccupancy = nullptr;
 Characteristic::StatusFault            *hkOccFault  = nullptr;
 Characteristic::CurrentTemperature     *hkStove      = nullptr;
 Characteristic::StatusFault            *hkStoveFault = nullptr;
+SpanCharacteristic                     *hkAlarm      = nullptr;   // sakelar Alarm (On)
 
 // Penanda waktu yang bentuknya mengikuti durasi, supaya tetap enak dibaca
 // setelah board menyala berjam-jam:  [3.1 s]  ->  [2:05]  ->  [1:23:45]
@@ -933,7 +936,6 @@ void bleProvisioning() {
 static bool          bagiNowSiap  = false;  // esp_now_init() sudah dipanggil
 static bool          bagiTertunda = false;  // diminta buka, tapi WiFi belum tersambung
 static bool          bagiTerbuka  = false;
-static bool          bagiTidurAwal = true;  // mode hemat daya WiFi sebelum jendela dibuka
 static unsigned long bagiMulai    = 0;
 
 // Diisi callback, dibaca loop(). Callback tidak menimpa selama bagiAdaMinta
@@ -942,6 +944,10 @@ static volatile bool bagiAdaMinta = false;
 static uint8_t       bagiMac[6];
 static uint8_t       bagiPubMinta[BW_PUB_LEN];
 
+// Laporan status dari Alarm (tombol fisik ditekan), diisi callback, dibaca loop().
+static volatile bool alarmAdaLapor = false;
+static volatile bool alarmLapor    = false;
+
 // Alarm mengulang permintaan yang sama selama menunggu. Jawaban terakhir
 // disimpan supaya ECDH tidak dihitung ulang untuk kunci publik yang sama.
 static BwJawab bagiJawab;
@@ -949,6 +955,14 @@ static uint8_t bagiPubTerakhir[BW_PUB_LEN];
 static bool    bagiAdaCache = false;
 
 BW_CB_TERIMA(bagiTerima) {
+  // Laporan status dari Alarm (tombol fisik) -> perbarui sakelar HomeKit.
+  if (bwKendaliSah(isi, len, BW_DARI_ALARM)) {
+    alarmLapor = ((const BwKendali *)isi)->nyala;
+    alarmAdaLapor = true;
+    return;
+  }
+
+  // Permintaan WiFi dari Alarm, hanya dilayani saat jendela pairing terbuka.
   if (!bagiTerbuka || bagiAdaMinta) return;
   if (!bwKepalaSah(isi, len, BW_MINTA, sizeof(BwMinta))) return;
 
@@ -957,27 +971,54 @@ BW_CB_TERIMA(bagiTerima) {
   bagiAdaMinta = true;
 }
 
+// ESP-NOW dipakai dua hal: berbagi WiFi (jendela pairing) dan kendali alarm
+// (kapan saja). Jadi diinit sekali begitu WiFi tersambung, callback tetap
+// terdaftar, dan modem sleep dimatikan supaya paket kendali tidak terlewat.
+void pastikanEspNow() {
+  if (bagiNowSiap || WiFi.status() != WL_CONNECTED) return;
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("[BAGI] ESP-NOW gagal dimulai.");
+    return;
+  }
+  esp_now_register_recv_cb(bagiTerima);
+
+  esp_now_peer_info_t peer = {};
+  memset(peer.peer_addr, 0xFF, 6);          // siaran untuk kirim perintah ke Alarm
+  peer.channel = 0;
+  peer.ifidx   = WIFI_IF_STA;
+  esp_now_add_peer(&peer);
+
+  WiFi.setSleep(false);
+  bagiNowSiap = true;
+  Serial.println("[BAGI] ESP-NOW siap (kendali alarm + berbagi WiFi).");
+}
+
+// Kirim perintah nyala/mati ke Alarm (sakelar di Home app / automation).
+void kirimKendaliAlarm(bool nyala) {
+  if (!bagiNowSiap) return;
+  BwKendali k;
+  bwIsiKendali(&k, BW_DARI_SENSOR, nyala);
+  static const uint8_t SIARAN[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  esp_now_send(SIARAN, (const uint8_t *)&k, sizeof(k));
+  Serial.printf("[ALARM] Perintah ke Alarm: %s\n", nyala ? "NYALA" : "MATI");
+}
+
+// Dipanggil dari loop(): terapkan laporan status Alarm ke sakelar HomeKit.
+void updateAlarmLapor() {
+  if (!alarmAdaLapor) return;
+  alarmAdaLapor = false;
+  if (hkAlarm) hkAlarm->setVal(alarmLapor ? 1 : 0);
+}
+
 void bukaJendelaBagi() {
-  if (WiFi.status() != WL_CONNECTED) {
+  pastikanEspNow();
+  if (!bagiNowSiap) {
     if (!bagiTertunda) Serial.println("[BAGI] Menunggu WiFi tersambung sebelum membuka pairing...");
     bagiTertunda = true;
     return;
   }
   bagiTertunda = false;
-
-  if (!bagiNowSiap) {
-    if (esp_now_init() != ESP_OK) {
-      Serial.println("[BAGI] ESP-NOW gagal dimulai, Alarm tidak bisa diberi WiFi.");
-      return;
-    }
-    esp_now_register_recv_cb(bagiTerima);
-    bagiNowSiap = true;
-  }
-
-  // Modem sleep mematikan radio di sela beacon, dan paket ESP-NOW yang tiba
-  // saat itu hilang. Selama jendela terbuka radio dibiarkan menyala terus.
-  if (!bagiTerbuka) bagiTidurAwal = WiFi.getSleep();
-  WiFi.setSleep(false);
 
   bagiAdaCache = false;
   bagiTerbuka  = true;
@@ -991,7 +1032,8 @@ void tutupJendelaBagi() {
   bagiAdaMinta = false;
   bagiAdaCache = false;
   memset(&bagiJawab, 0, sizeof(bagiJawab));
-  WiFi.setSleep(bagiTidurAwal);
+  // Modem sleep tetap dimatikan (lihat pastikanEspNow) supaya paket kendali
+  // alarm tidak terlewat walau jendela berbagi WiFi sudah ditutup.
   Serial.println("[BAGI] Pairing Alarm ditutup.");
 }
 
@@ -1138,7 +1180,7 @@ void cmdKodeHkBaru(const char *buf) {
 }
 
 // =====================================================
-// HomeKit: bridge + 4 accessory supaya tiap sensor punya tile sendiri di Home app
+// HomeKit: bridge + 5 sensor + 1 sakelar Alarm, tiap-tiap punya tile di Home app
 // =====================================================
 void newAccessoryInfo(const char *name, const char *serial) {
   new SpanAccessory();
@@ -1150,6 +1192,18 @@ void newAccessoryInfo(const char *name, const char *serial) {
     new Characteristic::FirmwareRevision("1.0.0");
     new Characteristic::Identify();
 }
+
+// Sakelar Alarm: perintah dari Home diteruskan ke board Alarm lewat ESP-NOW.
+// Status balik (tombol fisik Alarm) masuk lewat updateAlarmLapor().
+struct DEV_AlarmSwitch : Service::Switch {
+  DEV_AlarmSwitch() : Service::Switch() {
+    hkAlarm = new Characteristic::On(false);
+  }
+  boolean update() {
+    kirimKendaliAlarm(hkAlarm->getNewVal());
+    return true;
+  }
+};
 
 void setupHomeKit() {
   homeSpan.setPairingCode(hkCode);          // diacak per board, lihat muatAtauBuatKodeHk()
@@ -1202,6 +1256,10 @@ void setupHomeKit() {
     // dan ikut melebarkan pilihan ambang saat membuat automation.
     hkStove->setRange(KOMPOR_SUHU_MIN, KOMPOR_SUHU_MAX, 0.1);
     hkStoveFault = new Characteristic::StatusFault(0);
+
+  // Accessory 6: Alarm -- sakelar, relai ke board Alarm lewat ESP-NOW
+  newAccessoryInfo("Alarm", "A09-ALARM");
+  new DEV_AlarmSwitch();
 
   // Kedua sensor masih dalam proses inisialisasi di task masing-masing.
   setBmeFault(1);
@@ -1261,4 +1319,6 @@ void loop() {
   updateBME();
   updateTermal();
   updateBagiWifi();
+  pastikanEspNow();
+  updateAlarmLapor();
 }

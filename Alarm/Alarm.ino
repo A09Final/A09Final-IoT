@@ -1,10 +1,15 @@
 // Tombol + Speaker + OLED di ESP32-C3 OLED (0.42")
 // Tekan tombol -> alarm berbunyi (dua nada bergantian), tekan lagi -> alarm mati.
 // OLED menampilkan status alarm dan status tombol.
-// WiFi tidak diatur di board ini: diterima dari board Sensor lewat ESP-NOW.
 //
-// Mendapatkan WiFi:
-//   - Board yang belum punya WiFi otomatis masuk mode pairing (OLED: "Pairing").
+// Terhubung ke Apple HomeKit TANPA pairing sendiri: board Sensor-lah yang
+// menjadi bridge HomeKit dan menampilkan "Alarm" sebagai sakelar. Perintah
+// nyala/mati dan laporan status tombol berjalan dua arah lewat ESP-NOW
+// (lihat BagiWifi.h). Jadi cukup satu kali setup di Home app, di Sensor saja.
+//
+// Mendapatkan WiFi (perlu agar sejajar channel dengan Sensor untuk ESP-NOW):
+//   - Board yang belum punya WiFi otomatis masuk mode pairing (OLED: "Pairing")
+//     dan menerima WiFi dari Sensor lewat ESP-NOW.
 //   - Di Sensor, jendela pairing terbuka 2 menit setelah provisioning, atau
 //     ketik @P di Serial Monitor Sensor.
 //   - Untuk ganti WiFi: tahan tombol 5 detik (atau ketik P di Serial Monitor
@@ -12,7 +17,13 @@
 //
 // Sambungan:
 //   Tombol (pasangan kontak NO) -> GPIO 3 dan GND (bebas mana yang mana)
-//   Grove Speaker: SIG -> GPIO 4, VCC -> 5V, GND -> GND, NC tidak disambung
+//   Grove Speaker: SIG -> GPIO 4, GND -> GND
+//     Speaker ber-amplifier (ada potensiometer / kabel VCC): JANGAN sambung VCC
+//     langsung ke 5V -- amplifier yang selalu bertenaga mendesis terus. Sambung
+//     daya amp lewat transistor/MOSFET yang dikendalikan SPEAKER_EN (GPIO 10):
+//        GPIO 10 --[1k]--> base/gate transistor; speaker VCC lewat transistor.
+//     Firmware menyalakan amp hanya saat alarm berbunyi, jadi diam = benar-benar
+//     senyap. Speaker pasif 2 kabel tidak perlu ini.
 //   OLED onboard di GPIO 5 (SDA) dan GPIO 6 (SCL)
 //
 // Library: U8g2 (Library Manager)
@@ -33,10 +44,11 @@
 #error "Aktifkan Tools > USB CDC On Boot: Enabled, lalu upload ulang"
 #endif
 
-#define BUTTON_PIN   3
-#define SPEAKER_PIN  4
-#define OLED_SDA     5
-#define OLED_SCL     6
+#define BUTTON_PIN    3
+#define SPEAKER_PIN   4
+#define SPEAKER_EN_PIN 10    // ke transistor/MOSFET yang memutus daya amp speaker
+#define OLED_SDA      5
+#define OLED_SCL      6
 
 // Kontak tombol yang dipakai: false = NO, true = NC
 #define USE_NC           true
@@ -62,15 +74,51 @@ const uint8_t       PAIR_CH_MAKS   = 13;       // channel WiFi 2,4 GHz di Indone
 U8G2_SSD1306_72X40_ER_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, OLED_SCL, OLED_SDA);
 
 // ---------- Speaker lewat LEDC ----------
-// Frekuensi 0 = diam, dan pin tetap ditahan LOW supaya speaker tidak mendengung.
-#if ESP_ARDUINO_VERSION_MAJOR >= 3
-void speakerBegin()           { ledcAttach(SPEAKER_PIN, 1000, 10); ledcWriteTone(SPEAKER_PIN, 0); }
-void speakerTone(uint32_t hz) { ledcWriteTone(SPEAKER_PIN, hz); }
-#else
+// Saat diam: pin SIG ditahan LOW sebagai GPIO biasa (PWM duty 0 tidak selalu
+// menahannya benar-benar LOW), DAN daya amplifier diputus lewat SPEAKER_EN.
+// Desis yang terdengar saat alarm mati berasal dari amplifier yang selalu
+// bertenaga; memutus dayanya adalah satu-satunya cara membuatnya benar-benar
+// senyap. Untuk speaker pasif tanpa amplifier, SPEAKER_EN boleh dibiarkan.
 #define SPEAKER_CH 0
-void speakerBegin()           { ledcSetup(SPEAKER_CH, 1000, 10); ledcAttachPin(SPEAKER_PIN, SPEAKER_CH); ledcWriteTone(SPEAKER_CH, 0); }
-void speakerTone(uint32_t hz) { ledcWriteTone(SPEAKER_CH, hz); }
+bool speakerNyala = false;
+
+void speakerTone(uint32_t hz) {
+  if (hz == 0) {
+    if (speakerNyala) {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+      ledcDetach(SPEAKER_PIN);
+#else
+      ledcDetachPin(SPEAKER_PIN);
 #endif
+      speakerNyala = false;
+    }
+    pinMode(SPEAKER_PIN, OUTPUT);
+    digitalWrite(SPEAKER_PIN, LOW);
+    digitalWrite(SPEAKER_EN_PIN, LOW);     // matikan amp -> tidak ada desis
+    return;
+  }
+  digitalWrite(SPEAKER_EN_PIN, HIGH);      // nyalakan amp sebelum mengirim nada
+  if (!speakerNyala) {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    ledcAttach(SPEAKER_PIN, 1000, 10);
+#else
+    ledcSetup(SPEAKER_CH, 1000, 10);
+    ledcAttachPin(SPEAKER_PIN, SPEAKER_CH);
+#endif
+    speakerNyala = true;
+  }
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWriteTone(SPEAKER_PIN, hz);
+#else
+  ledcWriteTone(SPEAKER_CH, hz);
+#endif
+}
+
+void speakerBegin() {
+  pinMode(SPEAKER_EN_PIN, OUTPUT);
+  digitalWrite(SPEAKER_EN_PIN, LOW);
+  speakerTone(0);
+}
 
 // ---------- Status ----------
 bool buttonState = false;       // true = ditekan (sudah di-debounce)
@@ -93,6 +141,11 @@ unsigned long pairChannelMs = 0;
 unsigned long pairKirimMs = 0;
 volatile bool adaJawaban = false;
 BwJawab jawaban;
+
+// Kendali dari Sensor (perintah nyala/mati), diisi callback, dibaca loop().
+volatile bool adaPerintah   = false;
+volatile bool perintahNyala = false;
+bool alarmNowSiap = false;        // ESP-NOW mode normal siap (bukan pairing)
 
 mbedtls_ecp_group pairGrp;
 mbedtls_mpi       pairD;
@@ -167,14 +220,61 @@ void updateAlarmTone() {
   }
 }
 
-// ---------- WiFi dari Sensor lewat ESP-NOW ----------
-BW_CB_TERIMA(terimaJawaban) {
-  if (!pairing || adaJawaban) return;
-  if (!bwKepalaSah(isi, len, BW_JAWAB, sizeof(BwJawab))) return;
-  memcpy(&jawaban, isi, sizeof(jawaban));
-  adaJawaban = true;
+// ---------- ESP-NOW: terima jawaban WiFi (pairing) & perintah alarm (normal) ----------
+BW_CB_TERIMA(alarmTerima) {
+  if (pairing) {
+    if (adaJawaban) return;
+    if (!bwKepalaSah(isi, len, BW_JAWAB, sizeof(BwJawab))) return;
+    memcpy(&jawaban, isi, sizeof(jawaban));
+    adaJawaban = true;
+    return;
+  }
+  // Mode normal: perintah nyala/mati dari Sensor (sakelar di Home app).
+  if (!bwKendaliSah(isi, len, BW_DARI_SENSOR)) return;
+  perintahNyala = ((const BwKendali *)isi)->nyala;
+  adaPerintah = true;
 }
 
+// Beri tahu Sensor status alarm sekarang, supaya sakelar di Home ikut berubah.
+void laporStatus() {
+  if (!alarmNowSiap) return;
+  BwKendali k;
+  bwIsiKendali(&k, BW_DARI_ALARM, alarmOn);
+  static const uint8_t SIARAN[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  esp_now_send(SIARAN, (const uint8_t *)&k, sizeof(k));
+}
+
+// ESP-NOW mode normal (sudah tersambung WiFi): dengarkan perintah dari Sensor.
+void pastikanEspNowAlarm() {
+  if (alarmNowSiap || pairing) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("[KENDALI] ESP-NOW gagal dimulai.");
+    return;
+  }
+  esp_now_register_recv_cb(alarmTerima);
+
+  esp_now_peer_info_t peer = {};
+  memset(peer.peer_addr, 0xFF, 6);          // siaran untuk kirim laporan status
+  peer.channel = 0;
+  peer.ifidx   = WIFI_IF_STA;
+  esp_now_add_peer(&peer);
+
+  WiFi.setSleep(false);   // jangan lewatkan paket kendali saat modem sleep
+  alarmNowSiap = true;
+  Serial.println("[KENDALI] ESP-NOW siap, mendengar perintah dari Sensor.");
+}
+
+void updatePerintah() {
+  if (!adaPerintah) return;
+  adaPerintah = false;
+  // Perintah ini berasal dari Sensor; jangan lapor balik supaya tidak muter.
+  if (perintahNyala && !alarmOn)      startAlarm();
+  else if (!perintahNyala && alarmOn) stopAlarm();
+}
+
+// ---------- WiFi dari Sensor lewat ESP-NOW (pairing) ----------
 void kirimMinta() {
   static const uint8_t SIARAN[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
   esp_now_send(SIARAN, (const uint8_t *)&minta, sizeof(minta));
@@ -207,7 +307,7 @@ void mulaiPairing() {
     Serial.println("[WIFI] ESP-NOW gagal dimulai.");
     return;
   }
-  esp_now_register_recv_cb(terimaJawaban);
+  esp_now_register_recv_cb(alarmTerima);
 
   // Peer siaran, channel 0 = ikut channel radio saat ini.
   esp_now_peer_info_t peer = {};
@@ -315,11 +415,16 @@ void onButtonChange(bool pressed) {
   if (BUTTON_LATCHING) {
     if (pressed && !alarmOn) startAlarm();
     else if (!pressed && alarmOn) stopAlarm();
+    else { updateOLED(); return; }
   } else if (pressed) {
     pressCount++;
     if (alarmOn) stopAlarm();
     else startAlarm();
+  } else {
+    updateOLED();
+    return;
   }
+  laporStatus();     // beri tahu Sensor supaya sakelar di Home ikut berubah
   updateOLED();
 }
 
@@ -356,7 +461,13 @@ void loop() {
   }
 
   updateAlarmTone();
-  updatePairing();
+
+  if (pairing) {
+    updatePairing();
+  } else {
+    pastikanEspNowAlarm();
+    updatePerintah();
+  }
 
   // Tahan tombol lama = minta WiFi ulang. Untuk tombol latching, tahan memang
   // posisi normalnya, jadi hanya lewat Serial Monitor.

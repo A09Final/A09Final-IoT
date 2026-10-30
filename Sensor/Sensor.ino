@@ -5,7 +5,8 @@
 // - MLX90640 (I2C): kamera thermal 32x24, dipakai memantau panas kompor
 // - HomeSpan: bridge HomeKit berisi 5 accessory (Temperature, Humidity, Air Quality,
 //   Human Presence, Stove Heat)
-// - WiFi diatur lewat Bluetooth dari app iOS DapurSetup (SDK ESPProvision)
+// - WiFi diatur lewat Bluetooth dari app iOS DapurSetup (SDK ESPProvision),
+//   lalu diteruskan ke board Alarm lewat ESP-NOW (lihat BagiWifi.h)
 //
 // Library (Library Manager):
 //   - "bsec2" (Bosch) + "BME68x Sensor library" -- IAQ terkalibrasi
@@ -32,6 +33,9 @@
 //   3. Di app DapurSetup: pindai QR, pilih WiFi, isi kata sandi.
 //   4. Board menyala ulang, lalu tambahkan di Apple Home memakai kode pairing
 //      yang tertera di stiker.
+//   5. Begitu WiFi tersambung, jendela pairing Alarm terbuka 2 menit. Alarm
+//      yang belum punya WiFi (atau yang tombolnya ditahan 5 detik) otomatis
+//      menerima WiFi yang sama. Di luar itu, buka lagi dengan @P.
 //
 // Perintah Serial Monitor (diawali @):
 //   @Q  cetak ulang stiker perangkat
@@ -39,6 +43,7 @@
 //   @C  buat kode HomeKit baru (perangkat perlu di-pair ulang)
 //   @B  status BSEC: akurasi, IAQ, dan state kalibrasi di NVS
 //   @T  status kamera thermal + peta panas untuk mengarahkan kamera ke kompor
+//   @P  buka jendela pairing 2 menit untuk membagikan WiFi ke Alarm
 //   Bawaan HomeSpan: ? bantuan | A provisioning ulang | X hapus WiFi | U hapus pairing
 
 #include <Arduino.h>
@@ -51,6 +56,9 @@
 #include <Preferences.h>
 //fuzzy logic
 #include "FuzzyKompor.h"
+// berbagi WiFi ke Alarm
+#include <esp_now.h>
+#include "BagiWifi.h"
 
 // Generator QR bawaan ESP-IDF, dipakai untuk mencetak QR ke Serial Monitor.
 #if __has_include("qrcode.h")
@@ -125,6 +133,12 @@
 #define PROV_PREFIX   "DAPUR_"      // nama BLE jadi DAPUR_xxxxxx (6 digit MAC)
 #define PROV_NVS      "a09prov"     // ruang NVS tempat PoP disimpan
 const unsigned long PROV_TIMEOUT = 300000;   // 5 menit menunggu app
+
+// ---------- Berbagi WiFi ke Alarm lewat ESP-NOW ----------
+// Selama jendela ini terbuka, Alarm mana pun yang meminta akan diberi WiFi.
+// Sengaja pendek: inilah satu-satunya pagar yang menahan board asing.
+const unsigned long BAGI_JENDELA_MS = 120000;  // 2 menit
+#define BAGI_FLAG     "bagiwifi"    // kunci di PROV_NVS: buka jendela sekali setelah provisioning
 
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
   #define LED_WRITE(r, g, b) rgbLedWrite(LED_PIN, r, g, b)
@@ -890,6 +904,13 @@ void bleProvisioning() {
 
   if (provSukses) {
     homeSpan.setWifiCredentials(provSsid, provPwd);
+
+    // Board menyala ulang sebentar lagi, jadi pesan "bagikan ke Alarm" dititip
+    // di NVS dan dijalankan begitu WiFi tersambung di boot berikutnya.
+    Preferences pref;
+    pref.begin(PROV_NVS, false);
+    pref.putBool(BAGI_FLAG, true);
+    pref.end();
     LED_WRITE(0, 30, 0);
     Serial.printf("[PROV] Tersimpan untuk \"%s\". Restart...\n", provSsid);
   } else {
@@ -899,6 +920,144 @@ void bleProvisioning() {
 
   delay(5000);                       // beri waktu app menerima status berhasil
   ESP.restart();
+}
+
+// =====================================================
+// Berbagi WiFi ke Alarm lewat ESP-NOW
+//
+// ESP-NOW memakai radio yang sama dengan WiFi dan selalu berada di channel
+// router, jadi Alarm yang berpindah-pindah channel pasti menemukan Sensor di
+// sana. Callback terima berjalan di task WiFi; isinya cuma menyalin paket.
+// Hitungan ECDH dan pengiriman jawaban dikerjakan di loop().
+// =====================================================
+static bool          bagiNowSiap  = false;  // esp_now_init() sudah dipanggil
+static bool          bagiTertunda = false;  // diminta buka, tapi WiFi belum tersambung
+static bool          bagiTerbuka  = false;
+static bool          bagiTidurAwal = true;  // mode hemat daya WiFi sebelum jendela dibuka
+static unsigned long bagiMulai    = 0;
+
+// Diisi callback, dibaca loop(). Callback tidak menimpa selama bagiAdaMinta
+// masih true, jadi loop() selalu membaca paket yang utuh.
+static volatile bool bagiAdaMinta = false;
+static uint8_t       bagiMac[6];
+static uint8_t       bagiPubMinta[BW_PUB_LEN];
+
+// Alarm mengulang permintaan yang sama selama menunggu. Jawaban terakhir
+// disimpan supaya ECDH tidak dihitung ulang untuk kunci publik yang sama.
+static BwJawab bagiJawab;
+static uint8_t bagiPubTerakhir[BW_PUB_LEN];
+static bool    bagiAdaCache = false;
+
+BW_CB_TERIMA(bagiTerima) {
+  if (!bagiTerbuka || bagiAdaMinta) return;
+  if (!bwKepalaSah(isi, len, BW_MINTA, sizeof(BwMinta))) return;
+
+  memcpy(bagiMac, BW_MAC_PENGIRIM, 6);
+  memcpy(bagiPubMinta, ((const BwMinta *)isi)->pub, BW_PUB_LEN);
+  bagiAdaMinta = true;
+}
+
+void bukaJendelaBagi() {
+  if (WiFi.status() != WL_CONNECTED) {
+    if (!bagiTertunda) Serial.println("[BAGI] Menunggu WiFi tersambung sebelum membuka pairing...");
+    bagiTertunda = true;
+    return;
+  }
+  bagiTertunda = false;
+
+  if (!bagiNowSiap) {
+    if (esp_now_init() != ESP_OK) {
+      Serial.println("[BAGI] ESP-NOW gagal dimulai, Alarm tidak bisa diberi WiFi.");
+      return;
+    }
+    esp_now_register_recv_cb(bagiTerima);
+    bagiNowSiap = true;
+  }
+
+  // Modem sleep mematikan radio di sela beacon, dan paket ESP-NOW yang tiba
+  // saat itu hilang. Selama jendela terbuka radio dibiarkan menyala terus.
+  if (!bagiTerbuka) bagiTidurAwal = WiFi.getSleep();
+  WiFi.setSleep(false);
+
+  bagiAdaCache = false;
+  bagiTerbuka  = true;
+  bagiMulai    = millis();
+  Serial.printf("[BAGI] Pairing Alarm terbuka %lu detik (WiFi \"%s\", channel %d).\n",
+                BAGI_JENDELA_MS / 1000, WiFi.SSID().c_str(), WiFi.channel());
+}
+
+void tutupJendelaBagi() {
+  bagiTerbuka  = false;
+  bagiAdaMinta = false;
+  bagiAdaCache = false;
+  memset(&bagiJawab, 0, sizeof(bagiJawab));
+  WiFi.setSleep(bagiTidurAwal);
+  Serial.println("[BAGI] Pairing Alarm ditutup.");
+}
+
+// Kunci baru untuk tiap Alarm, dibuang lagi begitu jawaban jadi.
+bool susunJawabanBagi() {
+  mbedtls_ecp_group grp;
+  mbedtls_mpi       d;
+  mbedtls_ecp_group_init(&grp);
+  mbedtls_mpi_init(&d);
+
+  BwKredensial kred = {};
+  strlcpy(kred.ssid, WiFi.SSID().c_str(), sizeof(kred.ssid));
+  strlcpy(kred.pwd,  WiFi.psk().c_str(),  sizeof(kred.pwd));
+  uint8_t kunci[16];
+
+  bagiJawab.magic = BW_MAGIC;
+  bagiJawab.versi = BW_VERSI;
+  bagiJawab.jenis = BW_JAWAB;
+
+  bool ok = bwBuatKunci(&grp, &d, bagiJawab.pub) &&
+            bwTurunkanKunci(&grp, &d, bagiPubMinta, kunci);
+  if (ok) {
+    esp_fill_random(bagiJawab.nonce, BW_NONCE_LEN);
+    ok = bwGcm(true, kunci, bagiJawab.nonce, (const uint8_t *)&bagiJawab, BW_KEPALA_LEN,
+               (const uint8_t *)&kred, bagiJawab.sandi, sizeof(kred), bagiJawab.tag);
+  }
+
+  memset(&kred, 0, sizeof(kred));
+  memset(kunci, 0, sizeof(kunci));
+  mbedtls_mpi_free(&d);
+  mbedtls_ecp_group_free(&grp);
+
+  if (!ok) Serial.println("[BAGI] Gagal menyusun jawaban terenkripsi.");
+  return ok;
+}
+
+// Dipanggil dari loop().
+void updateBagiWifi() {
+  if (bagiTertunda && WiFi.status() == WL_CONNECTED) bukaJendelaBagi();
+  if (!bagiTerbuka) return;
+
+  if (millis() - bagiMulai >= BAGI_JENDELA_MS) {
+    tutupJendelaBagi();
+    return;
+  }
+  if (!bagiAdaMinta) return;
+
+  if (!bagiAdaCache || memcmp(bagiPubTerakhir, bagiPubMinta, BW_PUB_LEN) != 0) {
+    if (!susunJawabanBagi()) { bagiAdaMinta = false; return; }
+    memcpy(bagiPubTerakhir, bagiPubMinta, BW_PUB_LEN);
+    bagiAdaCache = true;
+    Serial.printf("[BAGI] Alarm %02X:%02X:%02X:%02X:%02X:%02X meminta WiFi, dikirim.\n",
+                  bagiMac[0], bagiMac[1], bagiMac[2], bagiMac[3], bagiMac[4], bagiMac[5]);
+  }
+
+  // channel 0 = ikut channel WiFi yang sedang dipakai
+  if (!esp_now_is_peer_exist(bagiMac)) {
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, bagiMac, 6);
+    peer.channel = 0;
+    peer.ifidx   = WIFI_IF_STA;
+    peer.encrypt = false;              // isinya sudah dienkripsi sendiri, lihat BagiWifi.h
+    esp_now_add_peer(&peer);
+  }
+  esp_now_send(bagiMac, (const uint8_t *)&bagiJawab, sizeof(bagiJawab));
+  bagiAdaMinta = false;
 }
 
 // ---------- Perintah Serial Monitor ----------
@@ -967,6 +1126,10 @@ void cmdStatusTermal(const char *buf) {
   mlxMintaPeta = true;
 }
 
+void cmdBagiWifi(const char *buf) {
+  bukaJendelaBagi();
+}
+
 void cmdKodeHkBaru(const char *buf) {
   muatAtauBuatKodeHk(true);
   homeSpan.setPairingCode(hkCode);
@@ -1002,6 +1165,7 @@ void setupHomeKit() {
   new SpanUserCommand('C', "- buat kode HomeKit baru (perlu pair ulang)", cmdKodeHkBaru);
   new SpanUserCommand('B', "- status BSEC + state kalibrasi di NVS", cmdStatusBsec);
   new SpanUserCommand('T', "- status kamera thermal + peta panas", cmdStatusTermal);
+  new SpanUserCommand('P', "- buka pairing 2 menit untuk membagikan WiFi ke Alarm", cmdBagiWifi);
 
   // Accessory 0: bridge itu sendiri
   newAccessoryInfo(HK_NAME, "A09-BRIDGE");
@@ -1080,6 +1244,15 @@ void setup() {
 
   setupHomeKit();
   cetakStiker();
+
+  // Baru selesai provisioning: bagikan WiFi ke Alarm begitu tersambung.
+  Preferences pref;
+  pref.begin(PROV_NVS, false);
+  if (pref.getBool(BAGI_FLAG, false)) {
+    pref.remove(BAGI_FLAG);
+    bagiTertunda = true;
+  }
+  pref.end();
 }
 
 void loop() {
@@ -1087,4 +1260,5 @@ void loop() {
   updateRadar();
   updateBME();
   updateTermal();
+  updateBagiWifi();
 }

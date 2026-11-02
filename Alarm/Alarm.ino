@@ -1,49 +1,52 @@
-// Tombol + Speaker + OLED di ESP32-C3 OLED (0.42")
+// Tombol + Speaker + OLED di ESP32-C3 OLED (0.42"), terhubung ke Apple HomeKit lewat HomeSpan
 // - Tekan tombol -> alarm berbunyi (dua nada bergantian), tekan lagi -> alarm mati.
 // - OLED menampilkan status alarm dan status tombol.
+// - HomeKit: satu accessory Switch "Alarm". Bisa dinyalakan dari Home app atau
+//   dari automation (mis. saat Stove Heat di board Sensor terlalu panas), dan
+//   ikut berubah saat tombol fisik ditekan.
 // - WiFi diatur lewat Bluetooth dari app iOS DapurSetup (SDK ESPProvision),
-//   sama seperti board Sensor. Kredensial disimpan di NVS lalu dipakai
-//   tersambung otomatis setiap boot.
+//   sama seperti board Sensor.
 //
 // Sambungan:
 //   Tombol (pasangan kontak NO) -> GPIO 3 dan GND (bebas mana yang mana)
 //   Grove Speaker: SIG -> GPIO 4, VCC -> 5V, GND -> GND, NC tidak disambung
 //   OLED onboard di GPIO 5 (SDA) dan GPIO 6 (SCL)
 //
-// Library (Library Manager): U8g2
+// Library (Library Manager): U8g2, HomeSpan
 //
 // Arduino IDE:
 //   Board            : "ESP32C3 Dev Module"
 //   USB CDC On Boot  : Enabled
-//   Partition Scheme : "Huge APP (3MB No OTA/1MB SPIFFS)" --- stack WiFi +
+//   Partition Scheme : "Huge APP (3MB No OTA/1MB SPIFFS)" --- HomeSpan + stack
 //                      Bluetooth tidak muat di partisi default
 //   Serial Monitor   : 115200 baud
 //
 // Keamanan pemasangan:
-//   PoP (PIN provisioning) diacak saat boot pertama lalu disimpan di NVS,
-//   jadi tiap board punya miliknya sendiri.
+//   PoP (PIN provisioning) dan kode pairing HomeKit sama-sama diacak saat boot
+//   pertama lalu disimpan di NVS, jadi tiap board punya miliknya sendiri.
 //   Saat mode setup, PoP juga tampil di OLED -- hanya orang yang memegang
 //   perangkat yang bisa membacanya, sama seperti stiker.
 //
 // Cara pakai pertama kali:
 //   1. Upload, buka Serial Monitor 115200.
-//   2. Board mencetak blok stiker berisi QR provisioning.
+//   2. Board mencetak blok stiker: QR provisioning + kode pairing HomeKit.
 //      OLED menampilkan "SETUP WIFI", nama BLE, dan PIN.
 //   3. Di app DapurSetup: pilih DAPUR_ALM_xxxxxx (atau pindai QR), isi PIN,
 //      pilih WiFi, isi kata sandi.
-//   4. Board menyala ulang lalu tersambung ke WiFi tersebut.
+//   4. Board menyala ulang, lalu tambahkan di Apple Home memakai kode pairing
+//      yang tertera di stiker.
 //   Selama mode setup, tombol dan speaker tetap berfungsi sebagai alarm lokal.
 //
-// Perintah Serial Monitor (ketik lalu Enter):
+// Perintah Serial Monitor (diawali @):
 //   @Q  cetak ulang stiker perangkat
 //   @R  buat PoP baru (QR lama jadi tidak berlaku)
-//   A   provisioning ulang lewat BLE
-//   X   hapus kredensial WiFi lalu restart
-//   ?   bantuan
+//   @C  buat kode HomeKit baru (perangkat perlu di-pair ulang)
+//   Bawaan HomeSpan: ? bantuan | A provisioning ulang | X hapus WiFi | U hapus pairing
 
 #include <Arduino.h>
 #include <Wire.h>
 #include <U8g2lib.h>
+#include "HomeSpan.h"
 #include "WiFi.h"
 #include "WiFiProv.h"
 #include <Preferences.h>
@@ -80,16 +83,20 @@ const uint32_t TONE_LOW  = 330;            // Hz
 const unsigned long TONE_STEP_MS = 250;    // lama tiap nada
 const unsigned long DEBOUNCE_MS  = 50;
 
-#define DEVICE_NAME      "Alarm-A09"
-#define WIFI_HOSTNAME    "a09-alarm"
+// ---------- HomeKit ----------
+#define HK_NAME          "Alarm-A09"
+#define HK_HOSTNAME      "a09-alarm"
+#define HK_MODEL         "ESP32-C3 OLED Speaker"
+// Kode pairing HomeKit tidak ditulis di sini: diacak per board saat boot
+// pertama, disimpan di NVS, lalu dicetak ke Serial Monitor.
+#define HK_SETUP_ID      "A09A"
 
 // ---------- Provisioning WiFi lewat BLE ----------
 // Protokol provisioning Espressif, berpasangan dengan app iOS DapurSetup.
 // App hanya menampilkan perangkat berawalan "DAPUR_", jadi alarm memakai
 // "DAPUR_ALM_" supaya tetap muncul tapi bisa dibedakan dari board Sensor.
 #define PROV_PREFIX   "DAPUR_ALM_"  // nama BLE jadi DAPUR_ALM_xxxxxx (6 digit MAC)
-#define PROV_NVS      "a09prov"     // ruang NVS tempat PoP disimpan
-#define WIFI_NVS      "a09wifi"     // ruang NVS tempat SSID dan kata sandi WiFi disimpan
+#define PROV_NVS      "a09prov"     // ruang NVS tempat PoP dan kode HomeKit disimpan
 const unsigned long PROV_TIMEOUT = 300000;   // 5 menit menunggu app
 
 U8G2_SSD1306_72X40_ER_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, OLED_SCL, OLED_SDA);
@@ -121,12 +128,13 @@ unsigned long lastReportMs = 0;
 bool modeSetup = false;
 const char *setupStatus = "Menunggu app";
 
-bool wifiTerakhir = false;       // untuk mencatat saat WiFi tersambung / putus
+SpanCharacteristic *hkAlarm = nullptr;    // Characteristic::On milik Switch "Alarm"
 
 static volatile bool provSukses = false;
 static char provSsid[33];
 static char provPwd[65];
 static char provPop[9]  = "";      // 8 karakter, unik per board
+static char hkCode[9]   = "";      // 8 angka kode pairing HomeKit, unik per board
 static char namaBLE[20] = "";      // DAPUR_ALM_xxxxxx
 
 bool readPressed() {
@@ -185,21 +193,25 @@ void updateOLED() {
 }
 
 // ---------- Alarm ----------
-void startAlarm() {
+// kabarkanHk = false saat perintah datang dari HomeKit sendiri, supaya nilainya
+// tidak dikirim balik ke Home app.
+void startAlarm(bool kabarkanHk = true) {
   if (alarmOn) return;
   alarmOn = true;
   tonePhase = false;
   lastToneMs = millis();
   speakerTone(TONE_HIGH);
   Serial.printf("[%7.1f s] >>> ALARM NYALA\n", millis() / 1000.0);
+  if (kabarkanHk && hkAlarm && !modeSetup) hkAlarm->setVal(true);
   updateOLED();
 }
 
-void stopAlarm() {
+void stopAlarm(bool kabarkanHk = true) {
   if (!alarmOn) return;
   alarmOn = false;
   speakerTone(0);
   Serial.printf("[%7.1f s] >>> ALARM MATI\n", millis() / 1000.0);
+  if (kabarkanHk && hkAlarm && !modeSetup) hkAlarm->setVal(false);
   updateOLED();
 }
 
@@ -246,9 +258,29 @@ void layaniTombolDanAlarm() {
 }
 
 // =====================================================
+// HomeKit: Switch "Alarm"
+// =====================================================
+struct AlarmSwitch : Service::Switch {
+  AlarmSwitch() : Service::Switch() {
+    hkAlarm = new Characteristic::On(false);
+  }
+
+  boolean update() override {
+    if (hkAlarm->getNewVal()) {
+      Serial.printf("[%7.1f s] HomeKit meminta alarm NYALA\n", millis() / 1000.0);
+      startAlarm(false);
+    } else {
+      Serial.printf("[%7.1f s] HomeKit meminta alarm MATI\n", millis() / 1000.0);
+      stopAlarm(false);
+    }
+    return true;
+  }
+};
+
+// =====================================================
 // Provisioning WiFi lewat BLE
-// Jalan saat kredensial WiFi belum ada di NVS, atau saat kamu ketik 'A' di
-// Serial Monitor. Setelah selesai (berhasil atau waktu habis) board restart.
+// Dipasang ke HomeSpan lewat setApFunction(), jadi fungsi ini jalan saat
+// kredensial WiFi belum ada, atau saat kamu ketik 'A' di Serial Monitor.
 // =====================================================
 void susunNamaBLE() {
   snprintf(namaBLE, sizeof(namaBLE), "%s%06X", PROV_PREFIX,
@@ -278,6 +310,44 @@ void muatAtauBuatPop(bool paksaBaru) {
   strlcpy(provPop, tersimpan.c_str(), sizeof(provPop));
 }
 
+// Apple menolak kode yang terlalu mudah ditebak, dan HomeSpan menghentikan
+// sketch sepenuhnya kalau diberi kode tidak sah. Jadi diperiksa dulu.
+bool kodeHkValid(const char *k) {
+  if (strlen(k) != 8) return false;
+  for (int i = 0; i < 8; i++)
+    if (k[i] < '0' || k[i] > '9') return false;
+
+  bool semuaSama = true;
+  for (int i = 1; i < 8; i++)
+    semuaSama &= (k[i] == k[0]);
+  if (semuaSama) return false;
+
+  return strcmp(k, "12345678") != 0 && strcmp(k, "87654321") != 0;
+}
+
+// Kode pairing HomeKit unik per board. Disimpan sendiri di NVS karena HomeSpan
+// hanya menyimpan bentuk teracaknya dan tidak bisa memberikan kodenya kembali.
+void muatAtauBuatKodeHk(bool paksaBaru) {
+  Preferences pref;
+  pref.begin(PROV_NVS, false);
+  String tersimpan = pref.getString("hkcode", "");
+
+  if (paksaBaru || !kodeHkValid(tersimpan.c_str())) {
+    char baru[9];
+    do {
+      for (int i = 0; i < 8; i++)
+        baru[i] = '0' + (esp_random() % 10);
+      baru[8] = '\0';
+    } while (!kodeHkValid(baru));
+    pref.putString("hkcode", baru);
+    tersimpan = baru;
+    Serial.println("[HK] Kode pairing baru dibuat untuk board ini.");
+  }
+  pref.end();
+
+  strlcpy(hkCode, tersimpan.c_str(), sizeof(hkCode));
+}
+
 #ifdef ADA_QRCODE
 // QR digambar dengan blok setengah supaya satu baris teks memuat dua baris modul.
 static void gambarQR(esp_qrcode_handle_t qr) {
@@ -301,7 +371,9 @@ static void gambarQR(esp_qrcode_handle_t qr) {
 }
 #endif
 
-// Blok siap cetak untuk ditempel di badan perangkat.
+// Blok siap cetak untuk ditempel di badan perangkat. Sengaja hanya memuat satu
+// QR: QR provisioning harus dipindai karena PoP-nya acak, sedangkan kode HomeKit
+// cukup diketik. Dua QR berdampingan hanya membuat orang salah pindai.
 void cetakStiker() {
   // Format JSON ini yang dibaca scanQRCode() di SDK ESPProvision.
   // "security":1 wajib: tanpa itu SDK iOS menganggap Security 2 dan gagal.
@@ -311,9 +383,14 @@ void cetakStiker() {
            "\"transport\":\"ble\",\"security\":1}",
            namaBLE, provPop);
 
+  HapQR qr;
+  const char *payloadHk = qr.get(strtoul(hkCode, NULL, 10), HK_SETUP_ID,
+                                 (uint8_t)Category::Switches);
+
   Serial.println("\n======== STIKER PERANGKAT (cetak & tempel) ========");
-  Serial.printf("  Nama         : %s\n", DEVICE_NAME);
+  Serial.printf("  Nama         : %s\n", HK_NAME);
   Serial.printf("  Serial       : %s\n", namaBLE);
+  Serial.printf("  Kode HomeKit : %.3s-%.2s-%.3s\n", hkCode, hkCode + 3, hkCode + 5);
   Serial.println();
 
 #ifdef ADA_QRCODE
@@ -325,6 +402,7 @@ void cetakStiker() {
   Serial.println("===================================================");
   Serial.printf("  PoP          : %s\n", provPop);
   Serial.printf("  Isi QR       : %s\n", isi);
+  Serial.printf("  Payload HK   : %s   (opsional, untuk QR HomeKit)\n", payloadHk);
   Serial.println("===================================================\n");
 #ifndef ADA_QRCODE
   Serial.println("[PROV] qrcode.h tidak tersedia: salin \"Isi QR\" ke pembuat QR mana pun.");
@@ -359,31 +437,6 @@ void provEvent(arduino_event_t *e) {
   }
 }
 
-// ---------- Kredensial WiFi di NVS ----------
-void simpanWifi(const char *ssid, const char *pwd) {
-  Preferences pref;
-  pref.begin(WIFI_NVS, false);
-  pref.putString("ssid", ssid);
-  pref.putString("pwd", pwd);
-  pref.end();
-}
-
-bool muatWifi(String &ssid, String &pwd) {
-  Preferences pref;
-  pref.begin(WIFI_NVS, true);
-  ssid = pref.getString("ssid", "");
-  pwd  = pref.getString("pwd", "");
-  pref.end();
-  return ssid.length() > 0;
-}
-
-void hapusWifi() {
-  Preferences pref;
-  pref.begin(WIFI_NVS, false);
-  pref.clear();
-  pref.end();
-}
-
 void bleProvisioning() {
   Serial.println("\n[PROV] Kredensial WiFi belum ada. Mulai provisioning lewat BLE.");
   modeSetup = true;
@@ -413,7 +466,7 @@ void bleProvisioning() {
   }
 
   if (provSukses) {
-    simpanWifi(provSsid, provPwd);
+    homeSpan.setWifiCredentials(provSsid, provPwd);
     Serial.printf("[PROV] Tersimpan untuk \"%s\". Restart...\n", provSsid);
   } else {
     setupStatus = "Waktu habis";
@@ -431,77 +484,52 @@ void bleProvisioning() {
   ESP.restart();
 }
 
-// ---------- WiFi ----------
-// Tidak menunggu tersambung: driver WiFi menyambung (dan menyambung ulang)
-// sendiri di latar belakang, jadi tombol dan alarm tidak pernah tertahan.
-void mulaiWifi(const String &ssid, const String &pwd) {
-  WiFi.mode(WIFI_STA);
-  WiFi.setHostname(WIFI_HOSTNAME);
-  WiFi.setAutoReconnect(true);
-  WiFi.begin(ssid.c_str(), pwd.c_str());
-  Serial.printf("[WIFI] Menyambung ke \"%s\"...\n", ssid.c_str());
-}
-
-void pantauWifi() {
-  bool sekarang = WiFi.isConnected();
-  if (sekarang == wifiTerakhir) return;
-  wifiTerakhir = sekarang;
-  if (sekarang)
-    Serial.printf("[WIFI] Tersambung, IP %s\n", WiFi.localIP().toString().c_str());
-  else
-    Serial.println("[WIFI] Terputus, mencoba menyambung ulang...");
-}
-
 // ---------- Perintah Serial Monitor ----------
-void cetakBantuan() {
-  Serial.println("\nPerintah:");
-  Serial.println("  @Q  cetak ulang stiker perangkat");
-  Serial.println("  @R  buat PoP baru (QR lama tidak berlaku)");
-  Serial.println("  A   provisioning ulang lewat BLE");
-  Serial.println("  X   hapus kredensial WiFi lalu restart\n");
+void cmdTampilStiker(const char *buf) {
+  cetakStiker();
 }
 
-void jalankanPerintah(const String &cmd) {
-  if (cmd.equalsIgnoreCase("@Q")) {
-    cetakStiker();
-  } else if (cmd.equalsIgnoreCase("@R")) {
-    muatAtauBuatPop(true);
-    Serial.println("[PROV] QR lama tidak berlaku lagi. Cetak ulang stiker di bawah.");
-    cetakStiker();
-  } else if (cmd.equalsIgnoreCase("A")) {
-    WiFi.disconnect(true);
-    bleProvisioning();               // selalu diakhiri restart
-  } else if (cmd.equalsIgnoreCase("X")) {
-    hapusWifi();
-    Serial.println("[WIFI] Kredensial dihapus. Restart...");
-    delay(500);
-    ESP.restart();
-  } else if (cmd == "?") {
-    cetakBantuan();
-  } else if (cmd.length()) {
-    Serial.printf("Perintah \"%s\" tidak dikenal, ketik ? untuk bantuan.\n", cmd.c_str());
-  }
+void cmdPopBaru(const char *buf) {
+  muatAtauBuatPop(true);
+  Serial.println("[PROV] QR lama tidak berlaku lagi. Cetak ulang stiker di bawah.");
+  cetakStiker();
 }
 
-// Dibaca per karakter supaya loop() tidak pernah menunggu Serial.
-void bacaSerial() {
-  static String buf;
-  while (Serial.available()) {
-    char c = Serial.read();
-    if (c == '\n' || c == '\r') {
-      buf.trim();
-      jalankanPerintah(buf);
-      buf = "";
-    } else if (buf.length() < 16) {
-      buf += c;
-    }
-  }
+void cmdKodeHkBaru(const char *buf) {
+  muatAtauBuatKodeHk(true);
+  homeSpan.setPairingCode(hkCode);
+  Serial.println("[HK] Perangkat perlu di-pair ulang dengan kode baru di bawah.");
+  cetakStiker();
+}
+
+void setupHomeKit() {
+  homeSpan.setPairingCode(hkCode);          // diacak per board, lihat muatAtauBuatKodeHk()
+  homeSpan.setQRID(HK_SETUP_ID);
+  homeSpan.setApFunction(bleProvisioning);  // WiFi lewat BLE, bukan Access Point
+  homeSpan.enableAutoStartAP();             // jalankan saat kredensial WiFi belum ada
+  homeSpan.setLogLevel(0);
+
+  homeSpan.begin(Category::Switches, HK_NAME, HK_HOSTNAME, HK_MODEL);
+
+  new SpanUserCommand('Q', "- cetak ulang stiker perangkat", cmdTampilStiker);
+  new SpanUserCommand('R', "- buat PoP baru (QR lama tidak berlaku)", cmdPopBaru);
+  new SpanUserCommand('C', "- buat kode HomeKit baru (perlu pair ulang)", cmdKodeHkBaru);
+
+  new SpanAccessory();
+  new Service::AccessoryInformation();
+    new Characteristic::Name(HK_NAME);
+    new Characteristic::Manufacturer("A09 Final");
+    new Characteristic::SerialNumber(namaBLE);
+    new Characteristic::Model(HK_MODEL);
+    new Characteristic::FirmwareRevision("1.0.0");
+    new Characteristic::Identify();
+  new AlarmSwitch();
 }
 
 void setup() {
   Serial.begin(115200);
   while (!Serial && millis() < 3000) delay(10);
-  Serial.println("\n=== Alarm (Tombol + Speaker + OLED) ===");
+  Serial.println("\n=== Alarm (Tombol + Speaker + OLED) + HomeKit ===");
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);   // pull-up internal, tanpa resistor
   speakerBegin();
@@ -514,14 +542,14 @@ void setup() {
 
   buttonState = lastReading = readPressed();
 
+  // Identitas provisioning disiapkan sebelum HomeSpan, karena setApFunction()
+  // bisa langsung dipanggil saat kredensial WiFi belum ada.
   susunNamaBLE();
   muatAtauBuatPop(false);
-  cetakStiker();
+  muatAtauBuatKodeHk(false);
 
-  // Belum ada WiFi tersimpan -> langsung masuk mode setup (diakhiri restart).
-  String ssid, pwd;
-  if (!muatWifi(ssid, pwd)) bleProvisioning();
-  mulaiWifi(ssid, pwd);
+  setupHomeKit();
+  cetakStiker();
 
   // Tombol terkunci yang sudah dalam posisi ditekan saat menyala langsung memicu alarm
   if (BUTTON_LATCHING && buttonState) startAlarm();
@@ -529,18 +557,16 @@ void setup() {
 }
 
 void loop() {
+  homeSpan.poll();
   layaniTombolDanAlarm();
-  bacaSerial();
-  pantauWifi();
 
   // Laporan rutin tiap 1 detik, supaya tetap terlihat walau Serial Monitor dibuka terlambat
   if (millis() - lastReportMs >= 1000) {
     lastReportMs = millis();
-    Serial.printf("[%7.1f s] Tombol: %s | Alarm: %s | Jumlah tekan: %lu | WiFi: %s\n",
+    Serial.printf("[%7.1f s] Tombol: %s | Alarm: %s | Jumlah tekan: %lu\n",
                   millis() / 1000.0,
                   buttonState ? "DITEKAN" : "DILEPAS",
                   alarmOn ? "NYALA" : "MATI",
-                  (unsigned long)pressCount,
-                  WiFi.isConnected() ? "TERSAMBUNG" : "PUTUS");
+                  (unsigned long)pressCount);
   }
 }

@@ -45,7 +45,7 @@ static char readKeyHash[65] = "";
 
 static esp_mqtt_client_handle_t klien = nullptr;
 static volatile bool tersambung  = false;
-static volatile bool loginDitolak = false;   // supaya pesannya tidak berulang tiap 5 detik
+static volatile bool loginDitolak = false;   // supaya pesannya tidak berulang tiap kali menyambung ulang
 static volatile bool brokerTakTerjangkau = false;   // sama, untuk gagal menjangkau alamat broker
 static bool ntpDimulai = false;
 
@@ -148,13 +148,15 @@ static void mulaiKlien() {
   cfg.credentials.client_id               = idAlat;
   cfg.credentials.username                = idAlat;     // ACL broker memakai %u = ID alat
   cfg.credentials.authentication.password = popTerpakai;
-  cfg.session.keepalive                   = 30;
+  // Broker mengumumkan "offline" sekitar 1,5x keepalive setelah alat hilang,
+  // jadi app melihat alat mati dalam ~15 detik.
+  cfg.session.keepalive                   = 10;
   // Broker mengumumkan "offline" sendiri kalau alat mati atau WiFi putus.
   cfg.session.last_will.topic             = topikStatus;
   cfg.session.last_will.msg               = "offline";
   cfg.session.last_will.qos               = 1;
   cfg.session.last_will.retain            = 1;
-  cfg.network.reconnect_timeout_ms        = 5000;
+  cfg.network.reconnect_timeout_ms        = 3000;
   cfg.outbox.limit                        = BATAS_ANTREAN;
 
   klien = esp_mqtt_client_init(&cfg);

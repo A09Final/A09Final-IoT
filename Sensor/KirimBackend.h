@@ -69,6 +69,8 @@ void backendPoll();
 
 bool backendTersambung();
 
+// Sketch memanggilnya tiap TELEMETRI_TIAP, dan saat itu juga kalau level bahaya
+// atau keberadaan orang berubah.
 // Menaruh telemetri di antrean kirim tanpa menunggu jaringan, jadi aman
 // dipanggil dari loop() tanpa menahan HomeSpan. false kalau belum tersambung.
 bool backendKirimTelemetri(const DataTelemetri &d);

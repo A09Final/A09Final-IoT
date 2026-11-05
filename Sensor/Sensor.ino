@@ -12,7 +12,7 @@
 //                   mengirim notifikasi darurat, dan board Alarm langsung
 //                   dibunyikan lewat UDP di WiFi yang sama (tanpa home hub)
 // - WiFi diatur lewat Bluetooth dari app iOS DapurSetup (SDK ESPProvision)
-// - Backend BeforeFire (MQTT): data sensor dikirim tiap 5 detik untuk layar
+// - Backend BeforeFire (MQTT): data sensor dikirim tiap 2 detik (dan langsung saat level bahaya atau orang berubah) untuk layar
 //   Monitor di app. Lihat KirimBackend.h.
 //
 // Library (Library Manager):
@@ -121,7 +121,11 @@
 #define LED_PIN     21     // LED RGB onboard
 
 // ---------- Backend ----------
-#define TELEMETRI_TIAP      5000    // ms, jeda kirim data sensor ke backend
+#define TELEMETRI_TIAP      2000    // ms, jeda kirim data sensor ke backend
+// Level bahaya atau keberadaan orang yang berubah dikirim saat itu juga, tanpa
+// menunggu TELEMETRI_TIAP. Jeda minimum ini menahan banjir pesan kalau radar
+// berkedip di batas jarak.
+#define TELEMETRI_JEDA_MIN  250
 // BSEC membaca tiap 3 detik. Tanpa data baru selama ini, nilai BME dianggap
 // tidak tersedia, supaya app tidak memamerkan angka lama seolah masih benar.
 #define BME_HILANG_MS       15000
@@ -835,11 +839,29 @@ void updateFuzzy() {
 // sedang bermasalah tidak dikirim nilainya, hanya namanya di unavailableSensors.
 // =====================================================
 void updateBackend() {
-  static unsigned long kirimMs = 0;
+  static unsigned long kirimMs            = 0;
+  static int           orangTerkirim      = -2;     // -2 = belum pernah kirim
+  static bool          adaKondisiTerkirim = false;
+  static Condition     kondisiTerkirim    = Condition::Normal;
 
   backendPoll();
-  if (!backendTersambung() || millis() - kirimMs < TELEMETRI_TIAP) return;
-  kirimMs = millis();
+  if (!backendTersambung()) return;
+
+  // Aturan yang sama dengan d.adaKondisi di bawah, dihitung lebih dulu supaya
+  // perubahan level bisa dikirim saat itu juga.
+  bool fuzzySudahMenilai = !isnan(fuzzySkor);
+  bool termalSegar = mlxOk && !mlxWarned && mlxFrameTerakhir != 0;
+  bool adaKondisi  = fuzzySudahMenilai && (termalSegar || bahaya != Condition::Normal);
+
+  bool berubah = presence != orangTerkirim || adaKondisi != adaKondisiTerkirim ||
+                 (adaKondisi && bahaya != kondisiTerkirim);
+  unsigned long sejakKirim = millis() - kirimMs;
+  if (sejakKirim < (berubah ? TELEMETRI_JEDA_MIN : TELEMETRI_TIAP)) return;
+
+  kirimMs            = millis();
+  orangTerkirim      = presence;
+  adaKondisiTerkirim = adaKondisi;
+  kondisiTerkirim    = bahaya;
 
   DataTelemetri d;
 
@@ -858,7 +880,7 @@ void updateBackend() {
   d.orang      = presence == 1;
   d.radarRusak = !d.adaOrang;
 
-  d.adaKompor   = mlxOk && !mlxWarned && mlxFrameTerakhir != 0;
+  d.adaKompor   = termalSegar;
   d.termalRusak = !d.adaKompor;
   d.komporC     = mlxKompor;
 
@@ -866,8 +888,7 @@ void updateBackend() {
   // berarti aman. Tanpa kamera, fuzzy hanya menahan level terakhir: Normal
   // tidak dikirim karena belum terbukti aman, tetapi level bahaya tetap
   // dikirim supaya tidak tersembunyi.
-  bool fuzzySudahMenilai = !isnan(fuzzySkor);
-  d.adaKondisi = fuzzySudahMenilai && (d.adaKompor || bahaya != Condition::Normal);
+  d.adaKondisi = adaKondisi;
   d.kondisi    = bahaya;
   d.skor       = fuzzySkor;
 

@@ -39,6 +39,18 @@
 #include "WiFi.h"
 #include "WiFiProv.h"
 #include <Preferences.h>
+#include <WiFiUdp.h>
+
+// Sinyal bahaya Sensor -> Alarm, langsung lewat WiFi rumah tanpa home hub.
+// Selama fuzzy berada di level Alarm, Sensor menyiarkan PESAN_BAHAYA (UDP
+// broadcast) tiap BAHAYA_KIRIM_TIAP. Alarm menganggap bahaya selesai kalau
+// tidak ada pesan selama BAHAYA_HILANG_MS.
+// ponytail: tanpa pengaman -- siapa pun di WiFi yang sama bisa membunyikan
+// alarm (tidak bisa mematikannya). Tambahkan HMAC kalau jaringannya tidak dipercaya.
+#define PORT_BAHAYA        41009
+#define PESAN_BAHAYA       "A09-BAHAYA"
+#define BAHAYA_KIRIM_TIAP  1000    // ms
+#define BAHAYA_HILANG_MS   5000    // ms, beberapa paket hilang masih dimaafkan
 
 // Generator QR bawaan ESP-IDF, dipakai untuk mencetak QR ke Serial Monitor.
 #if __has_include("qrcode.h")

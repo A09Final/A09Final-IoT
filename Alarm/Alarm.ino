@@ -4,6 +4,10 @@
 // - HomeKit: satu accessory Switch "Alarm". Bisa dinyalakan dari Home app atau
 //   dari automation (mis. saat Stove Heat di board Sensor terlalu panas), dan
 //   ikut berubah saat tombol fisik ditekan.
+// - Board Sensor: saat fuzzy mencapai level Alarm, Sensor menyiarkan sinyal UDP
+//   di WiFi yang sama dan alarm langsung berbunyi, tanpa home hub. Dimatikan
+//   lewat tombol / Home app; tidak berbunyi lagi sampai ada kejadian bahaya baru.
+//   Uji dengan @A di Serial Monitor Sensor.
 // - WiFi diatur lewat Bluetooth dari app iOS DapurSetup (SDK ESPProvision),
 //   sama seperti board Sensor.
 //
@@ -87,14 +91,38 @@ U8G2_SSD1306_72X40_ER_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, OLED_SCL, OLED_SDA);
 
 // ---------- Speaker lewat LEDC ----------
 // Frekuensi 0 = diam, dan pin tetap ditahan LOW supaya speaker tidak mendengung.
+#define SPEAKER_CH 5          // kanal LEDC paling atas di ESP32-C3 (0–5), jauh dari kanal HomeSpan
+bool speakerAktif = false;    // true = pin sedang dipegang LEDC
+
+// Diam = pin dilepas dari LEDC dan tidak di-drive (high-Z),
+// sama seperti saat ledcAttach dikomen
+void speakerLepas() {
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
-void speakerBegin()           { ledcAttach(SPEAKER_PIN, 1000, 10); ledcWriteTone(SPEAKER_PIN, 0); }
-void speakerTone(uint32_t hz) { ledcWriteTone(SPEAKER_PIN, hz); }
+  if (speakerAktif) ledcDetach(SPEAKER_PIN);
 #else
-#define SPEAKER_CH 0
-void speakerBegin()           { ledcSetup(SPEAKER_CH, 1000, 10); ledcAttachPin(SPEAKER_PIN, SPEAKER_CH); ledcWriteTone(SPEAKER_CH, 0); }
-void speakerTone(uint32_t hz) { ledcWriteTone(SPEAKER_CH, hz); }
+  if (speakerAktif) ledcDetachPin(SPEAKER_PIN);
 #endif
+  speakerAktif = false;
+  pinMode(SPEAKER_PIN, INPUT);
+}
+
+void speakerBegin() { speakerLepas(); }
+
+// hz = 0 -> diam, selain itu LEDC dipasang dan nada hz dibunyikan
+void speakerTone(uint32_t hz) {
+  if (hz == 0) { speakerLepas(); return; }
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  if (!speakerAktif) speakerAktif = ledcAttachChannel(SPEAKER_PIN, hz, 10, SPEAKER_CH);
+  if (speakerAktif) ledcWriteTone(SPEAKER_PIN, hz);
+#else
+  if (!speakerAktif) {
+    ledcSetup(SPEAKER_CH, hz, 10);
+    ledcAttachPin(SPEAKER_PIN, SPEAKER_CH);
+    speakerAktif = true;
+  }
+  ledcWriteTone(SPEAKER_CH, hz);
+#endif
+}
 
 // ---------- Status ----------
 bool buttonState = false;       // true = ditekan (sudah di-debounce)
@@ -113,6 +141,13 @@ bool modeSetup = false;
 const char *setupStatus = "Menunggu app";
 
 SpanCharacteristic *hkAlarm = nullptr;    // Characteristic::On milik Switch "Alarm"
+
+// Sinyal bahaya dari board Sensor (lihat Bersama/SetupPerangkat.h).
+WiFiUDP udpBahaya;
+bool udpSiap = false;
+bool bahayaSensor = false;      // Sensor sedang menyiarkan bahaya
+bool dibungkam = false;         // alarm dimatikan orang selama bahaya ini berlangsung
+unsigned long bahayaTerakhirMs = 0;
 
 bool readPressed() {
   bool level = digitalRead(BUTTON_PIN);
@@ -186,6 +221,9 @@ void startAlarm(bool kabarkanHk = true) {
 void stopAlarm(bool kabarkanHk = true) {
   if (!alarmOn) return;
   alarmOn = false;
+  // Sensor terus menyiarkan selama bahaya; tanpa ini alarm langsung berbunyi
+  // lagi sedetik setelah dimatikan.
+  if (bahayaSensor) dibungkam = true;
   speakerTone(0);
   Serial.printf("[%7.1f s] >>> ALARM MATI\n", millis() / 1000.0);
   if (kabarkanHk && hkAlarm && !modeSetup) hkAlarm->setVal(false);
@@ -232,6 +270,38 @@ void layaniTombolDanAlarm() {
   }
 
   updateAlarmTone();
+}
+
+// ---------- Sinyal dari board Sensor ----------
+// Pesan pertama dari suatu kejadian bahaya membunyikan alarm. Kalau orang
+// mematikannya, pesan berikutnya diabaikan sampai Sensor berhenti menyiarkan
+// (bahaya selesai), supaya kejadian bahaya berikutnya tetap membunyikan alarm.
+void layaniSinyalSensor() {
+  if (!udpSiap) {
+    if (WiFi.status() == WL_CONNECTED) udpSiap = udpBahaya.begin(PORT_BAHAYA);
+    return;
+  }
+
+  while (udpBahaya.parsePacket()) {
+    char buf[16] = {0};
+    udpBahaya.read(buf, sizeof(buf) - 1);
+    if (strcmp(buf, PESAN_BAHAYA) != 0) continue;
+
+    bahayaTerakhirMs = millis();
+    if (!bahayaSensor) {
+      bahayaSensor = true;
+      dibungkam = false;
+      Serial.printf("[%7.1f s] Sensor: BAHAYA dari %s\n", millis() / 1000.0,
+                    udpBahaya.remoteIP().toString().c_str());
+    }
+    if (!dibungkam) startAlarm();
+  }
+
+  if (bahayaSensor && millis() - bahayaTerakhirMs > BAHAYA_HILANG_MS) {
+    bahayaSensor = false;
+    dibungkam = false;
+    Serial.printf("[%7.1f s] Sensor: bahaya selesai\n", millis() / 1000.0);
+  }
 }
 
 // =====================================================
@@ -314,9 +384,12 @@ void setup() {
 void loop() {
   homeSpan.poll();
   layaniTombolDanAlarm();
+  layaniSinyalSensor();
 
-  // Laporan rutin tiap 1 detik, supaya tetap terlihat walau Serial Monitor dibuka terlambat
-  if (millis() - lastReportMs >= 1000) {
+  // Laporan rutin tiap 1 detik, supaya tetap terlihat walau Serial Monitor dibuka terlambat.
+  // Ditahan selama WiFi belum tersambung, supaya pesan "Trying to connect" HomeSpan
+  // tidak tenggelam.
+  if (WiFi.status() == WL_CONNECTED && millis() - lastReportMs >= 1000) {
     lastReportMs = millis();
     Serial.printf("[%7.1f s] Tombol: %s | Alarm: %s | Jumlah tekan: %lu\n",
                   millis() / 1000.0,

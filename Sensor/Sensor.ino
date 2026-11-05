@@ -12,6 +12,8 @@
 //                   mengirim notifikasi darurat, dan board Alarm langsung
 //                   dibunyikan lewat UDP di WiFi yang sama (tanpa home hub)
 // - WiFi diatur lewat Bluetooth dari app iOS DapurSetup (SDK ESPProvision)
+// - Backend BeforeFire (MQTT): data sensor dikirim tiap 5 detik untuk layar
+//   Monitor di app. Lihat KirimBackend.h.
 //
 // Library (Library Manager):
 //   - "bsec2" (Bosch) + "BME68x Sensor library" -- IAQ terkalibrasi
@@ -48,6 +50,7 @@
 //   @B  status BSEC: akurasi, IAQ, dan state kalibrasi di NVS
 //   @T  status kamera thermal + peta panas untuk mengarahkan kamera ke kompor
 //   @A  uji: kirim sinyal bahaya ke board Alarm selama 10 detik
+//   @M  status backend; "@M mqtt://<IP Mac>:1883" menyimpan alamat broker
 //   Bawaan HomeSpan: ? bantuan | A provisioning ulang | X hapus WiFi | U hapus pairing
 
 #include <Arduino.h>
@@ -58,6 +61,7 @@
 #include "../Bersama/SetupPerangkat.h"   // provisioning BLE + HomeKit, sama dengan Alarm
 //fuzzy logic
 #include "FuzzyKompor.h"
+#include "KirimBackend.h"                // data sensor ke backend lewat MQTT
 
 // ---------- Pin ----------
 #define I2C_SDA     8      // SDA, dipakai bersama BME688 dan MLX90640
@@ -116,6 +120,12 @@
 
 #define LED_PIN     21     // LED RGB onboard
 
+// ---------- Backend ----------
+#define TELEMETRI_TIAP      5000    // ms, jeda kirim data sensor ke backend
+// BSEC membaca tiap 3 detik. Tanpa data baru selama ini, nilai BME dianggap
+// tidak tersedia, supaya app tidak memamerkan angka lama seolah masih benar.
+#define BME_HILANG_MS       15000
+
 // ---------- HomeKit ----------
 #define HK_NAME          "Masterpiece-A09"
 #define HK_HOSTNAME      "a09-iot"
@@ -161,6 +171,7 @@ volatile float   bsecIaq     = 0;       // Static IAQ, 0..500
 volatile float   bsecCo2     = 0;       // perkiraan eCO2, ppm
 volatile uint8_t bsecAkurasi = 0;       // 0 = belum stabil ... 3 = terkalibrasi
 volatile unsigned long bsecSimpanTerakhir = 0;   // 0 = belum pernah sejak boot
+unsigned long bmeTerakhirMs = 0;        // hasil BSEC terakhir diproses loop(); 0 = belum ada
 
 int presence = -1;              // -1 = belum ada data, 0 = tidak ada, 1 = ada
 
@@ -526,6 +537,7 @@ void tugasBsec(void *) {
 void updateBME() {
   if (!bsecAdaData) return;
   bsecAdaData = false;
+  bmeTerakhirMs = millis();
 
   float   suhu    = bsecSuhu;
   float   lembap  = bsecLembap;
@@ -818,6 +830,42 @@ void updateFuzzy() {
 }
 
 // =====================================================
+// Backend: data sensor untuk layar Monitor di app
+// Dikirim dari loop() memakai ringkasan yang sama dengan HomeKit. Sensor yang
+// sedang bermasalah tidak dikirim nilainya, hanya namanya di unavailableSensors.
+// =====================================================
+void updateBackend() {
+  static unsigned long kirimMs = 0;
+
+  backendPoll();
+  if (!backendTersambung() || millis() - kirimMs < TELEMETRI_TIAP) return;
+  kirimMs = millis();
+
+  DataTelemetri d;
+
+  d.adaBme = bsecOk && bmeTerakhirMs != 0 && millis() - bmeTerakhirMs < BME_HILANG_MS;
+  d.bmeRusak = !d.adaBme;
+  if (d.adaBme) {
+    d.suhuC      = bsecSuhu;
+    d.lembapRH   = bsecLembap;
+    d.tekananHPa = bsecTekanan;
+    d.iaq        = bsecIaq;
+    d.iaqAkurasi = bsecAkurasi;
+    d.eco2Ppm    = bsecCo2;
+  }
+
+  d.adaOrang   = presence != -1;
+  d.orang      = presence == 1;
+  d.radarRusak = !d.adaOrang;
+
+  d.adaKompor   = mlxOk && !mlxWarned && mlxFrameTerakhir != 0;
+  d.termalRusak = !d.adaKompor;
+  d.komporC     = mlxKompor;
+
+  backendKirimTelemetri(d);
+}
+
+// =====================================================
 // Provisioning WiFi lewat BLE + identitas HomeKit
 // Isinya ada di Bersama/SetupPerangkat.h, dipakai bersama board Alarm.
 // Di sini hanya bagian yang khas Sensor: warna LED selama setup WiFi.
@@ -914,6 +962,7 @@ void setupHomeKit() {
   new SpanUserCommand('B', "- status BSEC + state kalibrasi di NVS", cmdStatusBsec);
   new SpanUserCommand('T', "- status kamera thermal + peta panas", cmdStatusTermal);
   new SpanUserCommand('A', "- uji: kirim sinyal bahaya ke board Alarm selama 10 detik", cmdUjiSinyal);
+  new SpanUserCommand('M', "- status backend; @M mqtt://<IP>:1883 | @M off", cmdBackend);
 
   // Accessory 0: bridge itu sendiri
   newAccessoryInfo(HK_NAME, "A09-BRIDGE");
@@ -999,6 +1048,7 @@ void setup() {
   xTaskCreatePinnedToCore(tugasTermal, "termal", 8192, NULL, 1, NULL, 1);
 
   setupHomeKit();
+  backendMulai(namaBLE, provPop);   // ID alat dan PoP dari Bersama/SetupPerangkat.h
 }
 
 void loop() {
@@ -1008,4 +1058,5 @@ void loop() {
   updateTermal();
   updateFuzzy();
   kirimSinyalAlarm();
+  updateBackend();
 }

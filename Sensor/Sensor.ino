@@ -862,6 +862,15 @@ void updateBackend() {
   d.termalRusak = !d.adaKompor;
   d.komporC     = mlxKompor;
 
+  // fuzzySkor tetap NAN sampai evaluasi pertama, jadi level awal Normal belum
+  // berarti aman. Tanpa kamera, fuzzy hanya menahan level terakhir: Normal
+  // tidak dikirim karena belum terbukti aman, tetapi level bahaya tetap
+  // dikirim supaya tidak tersembunyi.
+  bool fuzzySudahMenilai = !isnan(fuzzySkor);
+  d.adaKondisi = fuzzySudahMenilai && (d.adaKompor || bahaya != Condition::Normal);
+  d.kondisi    = bahaya;
+  d.skor       = fuzzySkor;
+
   backendKirimTelemetri(d);
 }
 

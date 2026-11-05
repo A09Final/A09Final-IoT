@@ -386,8 +386,10 @@ void loop() {
   layaniTombolDanAlarm();
   layaniSinyalSensor();
 
-  // Laporan rutin tiap 1 detik, supaya tetap terlihat walau Serial Monitor dibuka terlambat
-  if (millis() - lastReportMs >= 1000) {
+  // Laporan rutin tiap 1 detik, supaya tetap terlihat walau Serial Monitor dibuka terlambat.
+  // Ditahan selama WiFi belum tersambung, supaya pesan "Trying to connect" HomeSpan
+  // tidak tenggelam.
+  if (WiFi.status() == WL_CONNECTED && millis() - lastReportMs >= 1000) {
     lastReportMs = millis();
     Serial.printf("[%7.1f s] Tombol: %s | Alarm: %s | Jumlah tekan: %lu\n",
                   millis() / 1000.0,

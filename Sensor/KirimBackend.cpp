@@ -268,6 +268,17 @@ static void tulisAngka(PenulisJson &p, bool &pertama, const char *nama, float ni
   pertama = false;
 }
 
+// Nama level harus sama dengan alert.Condition di backend.
+static const char *namaKondisi(Condition c) {
+  switch (c) {
+    case Condition::Normal:   return "normal";
+    case Condition::Warning1: return "warning1";
+    case Condition::Warning2: return "warning2";
+    case Condition::Alarm:    return "alarm";
+  }
+  return nullptr;
+}
+
 bool backendKirimTelemetri(const DataTelemetri &d) {
   if (!backendTersambung() || !readKeyHash[0]) return false;
 
@@ -278,6 +289,12 @@ bool backendKirimTelemetri(const DataTelemetri &d) {
 
   time_t sekarang = time(nullptr);
   if (sekarang > JAM_SAH) tulis(p, ",\"measuredAt\":%ld", (long)sekarang);
+
+  const char *kondisi = d.adaKondisi ? namaKondisi(d.kondisi) : nullptr;
+  if (kondisi) {
+    tulis(p, ",\"condition\":\"%s\"", kondisi);
+    if (isfinite(d.skor)) tulis(p, ",\"score\":%.1f", d.skor);
+  }
 
   tulis(p, ",\"readings\":{");
   bool pertama = true;

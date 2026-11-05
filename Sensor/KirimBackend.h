@@ -8,8 +8,11 @@
 //                               broker sebagai MQTT Will kalau alat hilang.
 //   - beforefire/<id>/telemetry data sensor terakhir (JSON, retained).
 //
-// Yang belum ada di sini: alert (butuh evaluateFuzzy() dan push token) dan
-// perintah dari app (topic cmd/ack).
+// Hasil fuzzy ikut dikirim sebagai "condition" dan "score", supaya app bisa
+// menampilkan Safe / Unsafe / Dangerous.
+//
+// Yang belum ada di sini: alert (butuh push token) dan perintah dari app
+// (topic cmd/ack).
 //
 // Cara menyambungkan board ke backend:
 //   1. Di Mac:  scripts/mqtt-user.sh add <Serial> <PoP>   (keduanya ada di stiker)
@@ -24,6 +27,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include "FuzzyKompor.h"
 
 // Satu paket data sensor. Nilai yang penandanya false tidak ikut dikirim,
 // sehingga app menampilkannya sebagai "tidak tersedia".
@@ -41,6 +45,12 @@ struct DataTelemetri {
 
   bool    adaOrang   = false;
   bool    orang      = false; // LD2410B
+
+  // Hasil evaluateFuzzy(). Tidak dikirim kalau adaKondisi false, dan app
+  // menampilkannya sebagai "Unknown".
+  bool      adaKondisi = false;
+  Condition kondisi    = Condition::Normal;
+  float     skor       = NAN;
 
   // Sensor yang sedang bermasalah, dikirim di "unavailableSensors".
   bool    bmeRusak    = false;

@@ -10,9 +10,14 @@
 #include "mqtt_client.h"     // esp-mqtt, sudah ikut di core ESP32 -- tanpa library tambahan
 #include "mbedtls/md.h"
 
-// Alamat broker bawaan kalau belum pernah diatur lewat @M. Kosong = belum dipakai.
+// Alamat broker bawaan kalau belum pernah diatur lewat @M. Memakai nama .local
+// Mac yang menjalankan BeforeFire-Backend, karena nama itu tetap sama walaupun
+// IP Mac berganti. ESP32 mencari nama .local lewat mDNS
+// (CONFIG_LWIP_DNS_SUPPORT_MDNS_QUERIES di core ESP32).
+// Host-nya harus sama dengan SensorBackendConfiguration.defaultBackendAddress di app.
+// Ganti kalau server pindah ke Mac lain.
 #ifndef BACKEND_MQTT_URI
-  #define BACKEND_MQTT_URI ""
+  #define BACKEND_MQTT_URI "mqtt://Dericks-MacBook-Pro.local:1883"
 #endif
 
 #define BACKEND_NVS        "a09backend"
@@ -41,6 +46,7 @@ static char readKeyHash[65] = "";
 static esp_mqtt_client_handle_t klien = nullptr;
 static volatile bool tersambung  = false;
 static volatile bool loginDitolak = false;   // supaya pesannya tidak berulang tiap 5 detik
+static volatile bool brokerTakTerjangkau = false;   // sama, untuk gagal menjangkau alamat broker
 static bool ntpDimulai = false;
 
 // =====================================================
@@ -101,6 +107,7 @@ static void saatEventMqtt(void *, esp_event_base_t, int32_t idEvent, void *dataE
     case MQTT_EVENT_CONNECTED:
       tersambung   = true;
       loginDitolak = false;
+      brokerTakTerjangkau = false;
       // Retained, supaya backend yang baru menyala langsung tahu alat ini online.
       esp_mqtt_client_enqueue(e->client, topikStatus, "online", 0, 1, 1, true);
       Serial.printf("[BACKEND] Tersambung ke %s sebagai %s\n", uriBroker, idAlat);
@@ -119,6 +126,14 @@ static void saatEventMqtt(void *, esp_event_base_t, int32_t idEvent, void *dataE
         Serial.printf("[BACKEND] Broker menolak login (kode %d). Daftarkan board di Mac:\n"
                       "          scripts/mqtt-user.sh add %s <PoP dari stiker>\n",
                       e->error_handle->connect_return_code, idAlat);
+      }
+      // Gagal sebelum login: nama .local tidak ditemukan, IP salah, atau server mati.
+      if (e->error_handle &&
+          e->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT &&
+          !brokerTakTerjangkau) {
+        brokerTakTerjangkau = true;
+        Serial.printf("[BACKEND] Tidak bisa menjangkau %s. Pastikan server menyala dan satu WiFi,\n"
+                      "          atau atur alamat lain: @M mqtt://<IP Mac>:1883\n", uriBroker);
       }
       break;
 
@@ -166,6 +181,7 @@ static void hentikanKlien() {
   klien        = nullptr;
   tersambung   = false;
   loginDitolak = false;
+  brokerTakTerjangkau = false;
 }
 
 // =====================================================
@@ -320,8 +336,9 @@ void cmdBackend(const char *buf) {
     Serial.printf("[BACKEND] WiFi       : %s\n", WiFi.status() == WL_CONNECTED ? "tersambung" : "TIDAK tersambung");
     Serial.printf("[BACKEND] MQTT       : %s\n",
                   backendTersambung() ? "tersambung"
-                  : loginDitolak      ? "DITOLAK (cek user/PoP di broker)"
-                  : klien             ? "menyambung..."
+                  : loginDitolak        ? "DITOLAK (cek user/PoP di broker)"
+                  : brokerTakTerjangkau ? "TIDAK TERJANGKAU (cek alamat/server)"
+                  : klien               ? "menyambung..."
                                       : "mati");
     Serial.printf("[BACKEND] jam (NTP)  : %s\n", sekarang > JAM_SAH ? "sinkron" : "belum sinkron");
     Serial.printf("[BACKEND] readKeyHash: %s\n\n", readKeyHash[0] ? readKeyHash : "(belum dihitung)");

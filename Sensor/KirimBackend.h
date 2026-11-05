@@ -13,9 +13,11 @@
 //
 // Cara menyambungkan board ke backend:
 //   1. Di Mac:  scripts/mqtt-user.sh add <Serial> <PoP>   (keduanya ada di stiker)
-//   2. Di Serial Monitor:  @M mqtt://<IP Mac>:1883
-//      Alamat disimpan di NVS, jadi cukup sekali. "@M" saja menampilkan status,
-//      "@M off" mematikan pengiriman.
+//   2. Selesai. Board memakai alamat bawaan BACKEND_MQTT_URI (nama .local Mac
+//      server) begitu WiFi tersambung.
+//   Alamat lain bisa diatur di Serial Monitor:  @M mqtt://<IP Mac>:1883
+//   Alamat itu disimpan di NVS dan menggantikan alamat bawaan. "@M" saja
+//   menampilkan status, "@M off" mematikan pengiriman.
 //   Kalau PoP diganti dengan @R, daftarkan ulang board di langkah 1 memakai
 //   PoP baru; board otomatis login ulang dengan PoP itu.
 

@@ -51,6 +51,8 @@ struct DataTelemetri {
   bool      adaKondisi = false;
   Condition kondisi    = Condition::Normal;
   float     skor       = NAN;
+  uint8_t   ruleId     = 0; // 0 jika metadata CTA tidak tersedia.
+  unsigned long absenceDurationS = 0;
 
   // Sensor yang sedang bermasalah, dikirim di "unavailableSensors".
   bool    bmeRusak    = false;

@@ -204,6 +204,8 @@ static float mlxFrame[32 * 24];
 // Hasil fuzzy yang sudah dikonfirmasi. Hanya disentuh loop().
 Condition bahaya    = Condition::Normal;
 float     fuzzySkor = NAN;
+uint8_t   fuzzyRuleId = 0;
+unsigned long fuzzyAbsenceDurationS = 0;
 const char *NAMA_BAHAYA[] = { "NORMAL", "WASPADA 1", "WASPADA 2", "ALARM" };
 
 // ---------- Characteristic HomeKit ----------
@@ -832,6 +834,7 @@ void updateFuzzy() {
   if (presence == 1) terakhirAdaOrang = millis();
   if (millis() - evalMs < FUZZY_TIAP) return;
   evalMs = millis();
+  fuzzyRuleId = 0;
 
   // Tanpa panas kompor yang segar fuzzy tidak punya dasar: level terakhir dipertahankan.
   if (!mlxOk || mlxWarned || mlxFrameTerakhir == 0) return;
@@ -851,11 +854,16 @@ void updateFuzzy() {
   if (!out.valid) return;
   fuzzySkor = out.score;
 
-  if (out.condition == bahaya) { calonHitung = 0; return; }
-  if (out.condition != calon)  { calon = out.condition; calonHitung = 0; }
-  if (++calonHitung < FUZZY_KONFIRMASI) return;
+  if (out.condition != bahaya) {
+    if (out.condition != calon) { calon = out.condition; calonHitung = 0; }
+    if (++calonHitung < FUZZY_KONFIRMASI) return;
+    aturBahaya(out.condition);
+  }
   calonHitung = 0;
-  aturBahaya(out.condition);
+
+  // Simpan rule dan durasi dari evaluasi yang cocok dengan level terkonfirmasi.
+  fuzzyRuleId = out.ruleId;
+  fuzzyAbsenceDurationS = in.absenceDurationS;
 }
 
 // =====================================================
@@ -868,6 +876,7 @@ void updateBackend() {
   static int           orangTerkirim      = -2;     // -2 = belum pernah kirim
   static bool          adaKondisiTerkirim = false;
   static Condition     kondisiTerkirim    = Condition::Normal;
+  static uint8_t       ruleIdTerkirim     = 0;
 
   backendPoll();
   if (!backendTersambung()) return;
@@ -877,8 +886,11 @@ void updateBackend() {
   bool fuzzySudahMenilai = !isnan(fuzzySkor);
   bool termalSegar = mlxOk && !mlxWarned && mlxFrameTerakhir != 0;
   bool adaKondisi  = fuzzySudahMenilai && (termalSegar || bahaya != Condition::Normal);
+  bool bmeSegar = bsecOk && bmeTerakhirMs != 0 && millis() - bmeTerakhirMs < BME_HILANG_MS;
+  uint8_t ruleId = adaKondisi && termalSegar && bmeSegar && presence != -1 ? fuzzyRuleId : 0;
 
   bool berubah = presence != orangTerkirim || adaKondisi != adaKondisiTerkirim ||
+                 ruleId != ruleIdTerkirim ||
                  (adaKondisi && bahaya != kondisiTerkirim);
   unsigned long sejakKirim = millis() - kirimMs;
   if (sejakKirim < (berubah ? TELEMETRI_JEDA_MIN : TELEMETRI_TIAP)) return;
@@ -887,6 +899,7 @@ void updateBackend() {
   orangTerkirim      = presence;
   adaKondisiTerkirim = adaKondisi;
   kondisiTerkirim    = bahaya;
+  ruleIdTerkirim     = ruleId;
 
   DataTelemetri d;
   isiSensor(d);
@@ -898,6 +911,8 @@ void updateBackend() {
   d.adaKondisi = adaKondisi;
   d.kondisi    = bahaya;
   d.skor       = fuzzySkor;
+  d.ruleId     = ruleId;
+  d.absenceDurationS = fuzzyAbsenceDurationS;
 
   backendKirimTelemetri(d);
 }

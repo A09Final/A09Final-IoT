@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdint.h>
+
 // Data yang diberikan kepada fungsi fuzzy.
 struct FuzzyInput {
   bool presence;
@@ -23,6 +25,7 @@ struct FuzzyOutput {
   Condition condition;
   float score;
   bool valid;
+  uint8_t ruleId;  // 0 jika tidak ada rule aktif yang cocok.
 };
 
 // Deklarasi fungsi perhitungan fuzzy.

@@ -599,7 +599,7 @@ static void tulisReadings(PenulisJson &p, const DataTelemetri &d) {
 bool backendKirimTelemetri(const DataTelemetri &d) {
   if (!backendTersambung() || !readKeyHash[0]) return false;
 
-  char json[512];
+  char json[640];
   PenulisJson p{json, sizeof(json)};
 
   tulis(p, "{\"readKeyHash\":\"%s\"", readKeyHash);
@@ -611,6 +611,10 @@ bool backendKirimTelemetri(const DataTelemetri &d) {
   if (kondisi) {
     tulis(p, ",\"condition\":\"%s\"", kondisi);
     if (isfinite(d.skor)) tulis(p, ",\"score\":%.1f", d.skor);
+    if (d.ruleId != 0) {
+      tulis(p, ",\"assessment\":{\"condition\":\"%s\",\"valid\":true,\"rule_id\":%u,\"absence_duration_seconds\":%lu}",
+            kondisi, static_cast<unsigned int>(d.ruleId), d.absenceDurationS);
+    }
   }
 
   tulis(p, ",");

@@ -71,6 +71,45 @@ float alarmOutputFuzzy(float score) {
   );
 }
 
+namespace {
+// Simpan MIN seperti sebelumnya, serta ringkasan kecocokan semua syarat.
+struct RuleMatch {
+  float strength;
+  float sum;
+  unsigned int count;
+
+  RuleMatch(float membership) : RuleMatch(membership, membership, 1) {}
+  RuleMatch(float strength, float sum, unsigned int count)
+      : strength(strength), sum(sum), count(count) {}
+
+  float mean() const {
+    return isfinite(sum) ? sum / count : 0.0f;
+  }
+};
+
+RuleMatch andMatch(const RuleMatch& left, const RuleMatch& right) {
+  return {min(left.strength, right.strength), left.sum + right.sum, left.count + right.count};
+}
+
+struct RuleSupport {
+  float activation = 0.0f;
+  float meanMatch = 0.0f;
+  uint8_t ruleId = 0;
+
+  void include(uint8_t id, const RuleMatch& match) {
+    if (!(match.strength > 0.0f) || match.strength < activation) return;
+
+    const float mean = match.mean();
+    // Kalau MIN seri, lihat semua syarat. Jika masih seri, pilih ID terkecil.
+    if (match.strength > activation || mean > meanMatch || (mean == meanMatch && id < ruleId)) {
+      activation = match.strength;
+      meanMatch = mean;
+      ruleId = id;
+    }
+  }
+};
+}  // namespace
+
 FuzzyOutput evaluateFuzzy(const FuzzyInput& data) {
 /* Fuzzy keberadaan orang*/
   float presenceDetectedFuzzy;
@@ -227,7 +266,7 @@ FuzzyOutput evaluateFuzzy(const FuzzyInput& data) {
 
   // Rule 1:
   // Stove Normal AND IAQ Excellent/Good -> Normal
-  float rule1Strength = min(
+  const RuleMatch rule1Match = andMatch(
     stoveNormalFuzzy,
     iaqExcellentOrGood
   );
@@ -235,49 +274,49 @@ FuzzyOutput evaluateFuzzy(const FuzzyInput& data) {
   // Rule 2:
   // Stove Normal AND IAQ Lightly Polluted
   // AND durasi Short/Quite Long/Long -> Normal
-  float rule2Strength = min(
+  const RuleMatch rule2Match = andMatch(
     stoveNormalFuzzy,
-    min(lightlyPollutedFuzzy, absenceShortToLong)
+    andMatch(lightlyPollutedFuzzy, absenceShortToLong)
   );
 
   // Rule 3:
   // Stove Normal AND IAQ Lightly Polluted
   // AND orang tidak ada AND durasi Very Long -> Warning 1
-  float rule3Strength = min(
-    min(stoveNormalFuzzy, lightlyPollutedFuzzy),
-    min(presenceNotDetectedFuzzy, absenceVeryLongFuzzy)
+  const RuleMatch rule3Match = andMatch(
+    andMatch(stoveNormalFuzzy, lightlyPollutedFuzzy),
+    andMatch(presenceNotDetectedFuzzy, absenceVeryLongFuzzy)
   );
 
   // Rule 4:
   // Stove Normal AND IAQ Moderately Polluted
   // AND durasi Short/Quite Long -> Normal
-  float rule4Strength = min(
+  const RuleMatch rule4Match = andMatch(
     stoveNormalFuzzy,
-    min(moderatelyPollutedFuzzy, absenceShortOrQuite)
+    andMatch(moderatelyPollutedFuzzy, absenceShortOrQuite)
   );
 
   // Rule 5:
   // Stove Normal AND IAQ Moderately Polluted
   // AND orang tidak ada AND durasi Long/Very Long -> Warning 1
-  float rule5Strength = min(
-    min(stoveNormalFuzzy, moderatelyPollutedFuzzy),
-    min(presenceNotDetectedFuzzy, absenceLongOrVeryLong)
+  const RuleMatch rule5Match = andMatch(
+    andMatch(stoveNormalFuzzy, moderatelyPollutedFuzzy),
+    andMatch(presenceNotDetectedFuzzy, absenceLongOrVeryLong)
   );
 
   // Rule 6:
   // Stove Normal AND IAQ Heavy/Severe/Extreme
   // AND orang ada -> Normal
-  float rule6Strength = min(
+  const RuleMatch rule6Match = andMatch(
     stoveNormalFuzzy,
-    min(iaqHeavyToExtreme, presenceDetectedFuzzy)
+    andMatch(iaqHeavyToExtreme, presenceDetectedFuzzy)
   );
 
   // Rule 7:
   // Stove Normal AND IAQ Heavy/Severe/Extreme
   // AND orang tidak ada -> Warning 1
-  float rule7Strength = min(
+  const RuleMatch rule7Match = andMatch(
     stoveNormalFuzzy,
-    min(iaqHeavyToExtreme, presenceNotDetectedFuzzy)
+    andMatch(iaqHeavyToExtreme, presenceNotDetectedFuzzy)
   );
 
 
@@ -288,81 +327,81 @@ FuzzyOutput evaluateFuzzy(const FuzzyInput& data) {
   // Rule 8:
   // Stove Medium AND IAQ Excellent/Good
   // AND durasi Short -> Normal
-  float rule8Strength = min(
+  const RuleMatch rule8Match = andMatch(
     stoveMediumFuzzy,
-    min(iaqExcellentOrGood, absenceShortFuzzy)
+    andMatch(iaqExcellentOrGood, absenceShortFuzzy)
   );
 
   // Rule 9:
   // Stove Medium AND IAQ Excellent/Good
   // AND orang tidak ada AND durasi Quite Long/Long -> Warning 1
-  float rule9Strength = min(
-    min(stoveMediumFuzzy, iaqExcellentOrGood),
-    min(presenceNotDetectedFuzzy, absenceQuiteOrLong)
+  const RuleMatch rule9Match = andMatch(
+    andMatch(stoveMediumFuzzy, iaqExcellentOrGood),
+    andMatch(presenceNotDetectedFuzzy, absenceQuiteOrLong)
   );
 
   // Rule 10:
   // Stove Medium AND IAQ Excellent/Good
   // AND orang tidak ada AND durasi Very Long -> Warning 2
-  float rule10Strength = min(
-    min(stoveMediumFuzzy, iaqExcellentOrGood),
-    min(presenceNotDetectedFuzzy, absenceVeryLongFuzzy)
+  const RuleMatch rule10Match = andMatch(
+    andMatch(stoveMediumFuzzy, iaqExcellentOrGood),
+    andMatch(presenceNotDetectedFuzzy, absenceVeryLongFuzzy)
   );
 
   // Rule 11:
   // Stove Medium AND IAQ Lightly Polluted
   // AND orang ada -> Normal
-  float rule11Strength = min(
+  const RuleMatch rule11Match = andMatch(
     stoveMediumFuzzy,
-    min(lightlyPollutedFuzzy, presenceDetectedFuzzy)
+    andMatch(lightlyPollutedFuzzy, presenceDetectedFuzzy)
   );
 
   // Rule 12:
   // Stove Medium AND IAQ Lightly Polluted
   // AND orang tidak ada AND durasi Short/Quite Long -> Warning 1
-  float rule12Strength = min(
-    min(stoveMediumFuzzy, lightlyPollutedFuzzy),
-    min(presenceNotDetectedFuzzy, absenceShortOrQuite)
+  const RuleMatch rule12Match = andMatch(
+    andMatch(stoveMediumFuzzy, lightlyPollutedFuzzy),
+    andMatch(presenceNotDetectedFuzzy, absenceShortOrQuite)
   );
 
   // Rule 13:
   // Stove Medium AND IAQ Lightly Polluted
   // AND orang tidak ada AND durasi Long/Very Long -> Warning 2
-  float rule13Strength = min(
-    min(stoveMediumFuzzy, lightlyPollutedFuzzy),
-    min(presenceNotDetectedFuzzy, absenceLongOrVeryLong)
+  const RuleMatch rule13Match = andMatch(
+    andMatch(stoveMediumFuzzy, lightlyPollutedFuzzy),
+    andMatch(presenceNotDetectedFuzzy, absenceLongOrVeryLong)
   );
 
   // Rule 14:
   // Stove Medium AND IAQ Moderately Polluted
   // AND durasi Short -> Warning 1
-  float rule14Strength = min(
+  const RuleMatch rule14Match = andMatch(
     stoveMediumFuzzy,
-    min(moderatelyPollutedFuzzy, absenceShortFuzzy)
+    andMatch(moderatelyPollutedFuzzy, absenceShortFuzzy)
   );
 
   // Rule 15:
   // Stove Medium AND IAQ Moderately Polluted
   // AND orang tidak ada AND durasi Quite Long/Long/Very Long -> Warning 2
-  float rule15Strength = min(
-    min(stoveMediumFuzzy, moderatelyPollutedFuzzy),
-    min(presenceNotDetectedFuzzy, absenceQuiteToVeryLong)
+  const RuleMatch rule15Match = andMatch(
+    andMatch(stoveMediumFuzzy, moderatelyPollutedFuzzy),
+    andMatch(presenceNotDetectedFuzzy, absenceQuiteToVeryLong)
   );
 
   // Rule 16:
   // Stove Medium AND IAQ Heavy/Severe/Extreme
   // AND orang ada -> Warning 1
-  float rule16Strength = min(
+  const RuleMatch rule16Match = andMatch(
     stoveMediumFuzzy,
-    min(iaqHeavyToExtreme, presenceDetectedFuzzy)
+    andMatch(iaqHeavyToExtreme, presenceDetectedFuzzy)
   );
 
   // Rule 17:
   // Stove Medium AND IAQ Heavy/Severe/Extreme
   // AND orang tidak ada -> Warning 2
-  float rule17Strength = min(
+  const RuleMatch rule17Match = andMatch(
     stoveMediumFuzzy,
-    min(iaqHeavyToExtreme, presenceNotDetectedFuzzy)
+    andMatch(iaqHeavyToExtreme, presenceNotDetectedFuzzy)
   );
 
 
@@ -373,62 +412,62 @@ FuzzyOutput evaluateFuzzy(const FuzzyInput& data) {
   // Rule 18:
   // Stove High AND IAQ Excellent/Good
   // AND orang ada -> Normal
-  float rule18Strength = min(
+  const RuleMatch rule18Match = andMatch(
     stoveHighFuzzy,
-    min(iaqExcellentOrGood, presenceDetectedFuzzy)
+    andMatch(iaqExcellentOrGood, presenceDetectedFuzzy)
   );
 
   // Rule 19:
   // Stove High AND IAQ Excellent/Good
   // AND orang tidak ada AND durasi Short/Quite Long -> Warning 1
-  float rule19Strength = min(
-    min(stoveHighFuzzy, iaqExcellentOrGood),
-    min(presenceNotDetectedFuzzy, absenceShortOrQuite)
+  const RuleMatch rule19Match = andMatch(
+    andMatch(stoveHighFuzzy, iaqExcellentOrGood),
+    andMatch(presenceNotDetectedFuzzy, absenceShortOrQuite)
   );
 
   // Rule 20:
   // Stove High AND IAQ Excellent/Good
   // AND orang tidak ada AND durasi Long/Very Long -> Warning 2
-  float rule20Strength = min(
-    min(stoveHighFuzzy, iaqExcellentOrGood),
-    min(presenceNotDetectedFuzzy, absenceLongOrVeryLong)
+  const RuleMatch rule20Match = andMatch(
+    andMatch(stoveHighFuzzy, iaqExcellentOrGood),
+    andMatch(presenceNotDetectedFuzzy, absenceLongOrVeryLong)
   );
 
   // Rule 21:
   // Stove High AND IAQ Lightly Polluted
   // AND durasi Short -> Warning 1
-  float rule21Strength = min(
+  const RuleMatch rule21Match = andMatch(
     stoveHighFuzzy,
-    min(lightlyPollutedFuzzy, absenceShortFuzzy)
+    andMatch(lightlyPollutedFuzzy, absenceShortFuzzy)
   );
 
   // Rule 22:
   // Stove High AND IAQ Lightly Polluted
   // AND orang tidak ada AND durasi Quite Long/Long/Very Long -> Warning 2
-  float rule22Strength = min(
-    min(stoveHighFuzzy, lightlyPollutedFuzzy),
-    min(presenceNotDetectedFuzzy, absenceQuiteToVeryLong)
+  const RuleMatch rule22Match = andMatch(
+    andMatch(stoveHighFuzzy, lightlyPollutedFuzzy),
+    andMatch(presenceNotDetectedFuzzy, absenceQuiteToVeryLong)
   );
 
   // Rule 23:
   // Stove High AND IAQ Moderately Polluted
   // AND orang ada -> Warning 1
-  float rule23Strength = min(
+  const RuleMatch rule23Match = andMatch(
     stoveHighFuzzy,
-    min(moderatelyPollutedFuzzy, presenceDetectedFuzzy)
+    andMatch(moderatelyPollutedFuzzy, presenceDetectedFuzzy)
   );
 
   // Rule 24:
   // Stove High AND IAQ Moderately Polluted
   // AND orang tidak ada -> Warning 2
-  float rule24Strength = min(
+  const RuleMatch rule24Match = andMatch(
     stoveHighFuzzy,
-    min(moderatelyPollutedFuzzy, presenceNotDetectedFuzzy)
+    andMatch(moderatelyPollutedFuzzy, presenceNotDetectedFuzzy)
   );
 
   // Rule 25:
   // Stove High AND IAQ Heavy/Severe/Extreme -> Warning 2
-  float rule25Strength = min(
+  const RuleMatch rule25Match = andMatch(
     stoveHighFuzzy,
     iaqHeavyToExtreme
   );
@@ -441,106 +480,106 @@ FuzzyOutput evaluateFuzzy(const FuzzyInput& data) {
   // Rule 26:
   // Stove Very High AND IAQ Excellent/Good
   // AND durasi Short/Quite Long -> Warning 2
-  float rule26Strength = min(
+  const RuleMatch rule26Match = andMatch(
     stoveVeryHighFuzzy,
-    min(iaqExcellentOrGood, absenceShortOrQuite)
+    andMatch(iaqExcellentOrGood, absenceShortOrQuite)
   );
 
   // Rule 27:
   // Stove Very High AND IAQ Excellent/Good
   // AND orang tidak ada AND durasi Long/Very Long -> Alarm
-  float rule27Strength = min(
-    min(stoveVeryHighFuzzy, iaqExcellentOrGood),
-    min(presenceNotDetectedFuzzy, absenceLongOrVeryLong)
+  const RuleMatch rule27Match = andMatch(
+    andMatch(stoveVeryHighFuzzy, iaqExcellentOrGood),
+    andMatch(presenceNotDetectedFuzzy, absenceLongOrVeryLong)
   );
 
   // Rule 28:
   // Stove Very High AND IAQ Lightly Polluted
   // AND durasi Short -> Warning 2
-  float rule28Strength = min(
+  const RuleMatch rule28Match = andMatch(
     stoveVeryHighFuzzy,
-    min(lightlyPollutedFuzzy, absenceShortFuzzy)
+    andMatch(lightlyPollutedFuzzy, absenceShortFuzzy)
   );
 
   // Rule 29:
   // Stove Very High AND IAQ Lightly Polluted
   // AND orang tidak ada AND durasi Quite Long/Long/Very Long -> Alarm
-  float rule29Strength = min(
-    min(stoveVeryHighFuzzy, lightlyPollutedFuzzy),
-    min(presenceNotDetectedFuzzy, absenceQuiteToVeryLong)
+  const RuleMatch rule29Match = andMatch(
+    andMatch(stoveVeryHighFuzzy, lightlyPollutedFuzzy),
+    andMatch(presenceNotDetectedFuzzy, absenceQuiteToVeryLong)
   );
 
   // Rule 30:
   // Stove Very High AND IAQ Moderately Polluted
   // AND orang ada -> Warning 2
-  float rule30Strength = min(
+  const RuleMatch rule30Match = andMatch(
     stoveVeryHighFuzzy,
-    min(moderatelyPollutedFuzzy, presenceDetectedFuzzy)
+    andMatch(moderatelyPollutedFuzzy, presenceDetectedFuzzy)
   );
 
   // Rule 31:
   // Stove Very High AND IAQ Moderately Polluted
   // AND orang tidak ada -> Alarm
-  float rule31Strength = min(
+  const RuleMatch rule31Match = andMatch(
     stoveVeryHighFuzzy,
-    min(moderatelyPollutedFuzzy, presenceNotDetectedFuzzy)
+    andMatch(moderatelyPollutedFuzzy, presenceNotDetectedFuzzy)
   );
 
   // Rule 32:
   // Stove Very High AND IAQ Heavy/Severe/Extreme -> Alarm
-  float rule32Strength = min(
+  const RuleMatch rule32Match = andMatch(
     stoveVeryHighFuzzy,
     iaqHeavyToExtreme
   );
 
-  float normalActivation = 0.0;
-  float warning1Activation = 0.0;
-  float warning2Activation = 0.0;
-  float alarmActivation = 0.0;
+  RuleSupport normalSupport;
+  RuleSupport warning1Support;
+  RuleSupport warning2Support;
+  RuleSupport alarmSupport;
 
 
   // Dukungan untuk Normal
-  normalActivation = max(normalActivation, rule1Strength);
-  normalActivation = max(normalActivation, rule2Strength);
-  normalActivation = max(normalActivation, rule4Strength);
-  normalActivation = max(normalActivation, rule6Strength);
-  normalActivation = max(normalActivation, rule8Strength);
-  normalActivation = max(normalActivation, rule11Strength);
-  normalActivation = max(normalActivation, rule18Strength);
+  normalSupport.include(1, rule1Match);
+  normalSupport.include(2, rule2Match);
+  normalSupport.include(4, rule4Match);
+  normalSupport.include(6, rule6Match);
+  normalSupport.include(8, rule8Match);
+  normalSupport.include(11, rule11Match);
+  normalSupport.include(18, rule18Match);
 
 
   // Dukungan untuk Warning 1
-  warning1Activation = max(warning1Activation, rule3Strength);
-  warning1Activation = max(warning1Activation, rule5Strength);
-  warning1Activation = max(warning1Activation, rule7Strength);
-  warning1Activation = max(warning1Activation, rule9Strength);
-  warning1Activation = max(warning1Activation, rule12Strength);
-  warning1Activation = max(warning1Activation, rule14Strength);
-  warning1Activation = max(warning1Activation, rule16Strength);
-  warning1Activation = max(warning1Activation, rule19Strength);
-  warning1Activation = max(warning1Activation, rule21Strength);
-  warning1Activation = max(warning1Activation, rule23Strength);
+  warning1Support.include(3, rule3Match);
+  warning1Support.include(5, rule5Match);
+  warning1Support.include(7, rule7Match);
+  warning1Support.include(9, rule9Match);
+  warning1Support.include(12, rule12Match);
+  warning1Support.include(14, rule14Match);
+  warning1Support.include(16, rule16Match);
+  warning1Support.include(19, rule19Match);
+  warning1Support.include(21, rule21Match);
+  warning1Support.include(23, rule23Match);
 
 
   // Dukungan untuk Warning 2
-  warning2Activation = max(warning2Activation, rule10Strength);
-  warning2Activation = max(warning2Activation, rule13Strength);
-  warning2Activation = max(warning2Activation, rule15Strength);
-  warning2Activation = max(warning2Activation, rule17Strength);
-  warning2Activation = max(warning2Activation, rule20Strength);
-  warning2Activation = max(warning2Activation, rule22Strength);
-  warning2Activation = max(warning2Activation, rule24Strength);
-  warning2Activation = max(warning2Activation, rule25Strength);
-  warning2Activation = max(warning2Activation, rule26Strength);
-  warning2Activation = max(warning2Activation, rule28Strength);
-  warning2Activation = max(warning2Activation, rule30Strength);
+  warning2Support.include(10, rule10Match);
+  warning2Support.include(13, rule13Match);
+  warning2Support.include(15, rule15Match);
+  warning2Support.include(17, rule17Match);
+  warning2Support.include(20, rule20Match);
+  warning2Support.include(22, rule22Match);
+  warning2Support.include(24, rule24Match);
+  warning2Support.include(25, rule25Match);
+  warning2Support.include(26, rule26Match);
+  warning2Support.include(28, rule28Match);
+  warning2Support.include(30, rule30Match);
 
 
   // Dukungan untuk Alarm
-  alarmActivation = max(alarmActivation, rule27Strength);
-  alarmActivation = max(alarmActivation, rule29Strength);
-  alarmActivation = max(alarmActivation, rule31Strength);
-  alarmActivation = max(alarmActivation, rule32Strength);
+  alarmSupport.include(27, rule27Match);
+  alarmSupport.include(29, rule29Match);
+  alarmSupport.include(31, rule31Match);
+  alarmSupport.include(32, rule32Match);
 
   float numerator = 0.0;
   float denominator = 0.0;
@@ -551,22 +590,22 @@ FuzzyOutput evaluateFuzzy(const FuzzyInput& data) {
 
     // Potong masing-masing kurva sesuai aktivasinya.
     float clippedNormal = min(
-      normalActivation,
+      normalSupport.activation,
       normalOutputFuzzy(scorePoint)
     );
 
     float clippedWarning1 = min(
-      warning1Activation,
+      warning1Support.activation,
       warning1OutputFuzzy(scorePoint)
     );
 
     float clippedWarning2 = min(
-      warning2Activation,
+      warning2Support.activation,
       warning2OutputFuzzy(scorePoint)
     );
 
     float clippedAlarm = min(
-      alarmActivation,
+      alarmSupport.activation,
       alarmOutputFuzzy(scorePoint)
     );
 
@@ -606,6 +645,7 @@ FuzzyOutput evaluateFuzzy(const FuzzyInput& data) {
   result.condition = Condition::Normal;
   result.score = riskScore;
   result.valid = false;
+  result.ruleId = 0;
 
   // Label hanya ditentukan jika skor valid.
   if (
@@ -618,12 +658,16 @@ FuzzyOutput evaluateFuzzy(const FuzzyInput& data) {
 
     if (riskScore < 25.0) {
       result.condition = Condition::Normal;
+      result.ruleId = normalSupport.ruleId;
     } else if (riskScore < 50.0) {
       result.condition = Condition::Warning1;
+      result.ruleId = warning1Support.ruleId;
     } else if (riskScore < 75.0) {
       result.condition = Condition::Warning2;
+      result.ruleId = warning2Support.ruleId;
     } else {
       result.condition = Condition::Alarm;
+      result.ruleId = alarmSupport.ruleId;
     }
   }
 

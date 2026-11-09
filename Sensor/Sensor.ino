@@ -3,14 +3,13 @@
 //   IAQ terkalibrasi beserta indikator akurasinya, dan perkiraan eCO2
 // - LD2410B (UART): ada / tidak ada orang
 // - MLX90640 (I2C): kamera thermal 32x24, dipakai memantau panas kompor
-// - HomeSpan: bridge HomeKit berisi 7 accessory (Temperature, Humidity, Air Quality,
-//   Human Presence, Stove Heat, Stove Warning, Stove Danger)
+// - HomeSpan: bridge HomeKit berisi 5 accessory (Temperature, Humidity, Air Quality,
+//   Human Presence, Stove Heat)
 // - Fuzzy (FuzzyKompor.cpp): suhu kompor + IAQ + kehadiran + lama ditinggal
-//   -> Normal / Waspada 1 / Waspada 2 / Alarm.
-//     Waspada 1/2 : LED kuning/jingga + "Stove Warning" terbuka di Home app
-//     Alarm       : LED merah + "Stove Danger" mendeteksi asap -> iPhone
-//                   mengirim notifikasi darurat, dan board Alarm langsung
-//                   dibunyikan lewat UDP di WiFi yang sama (tanpa home hub)
+//   -> Normal / Waspada 1 / Waspada 2 / Alarm, dikirim ke backend.
+//     Waspada 1/2 : LED kuning/jingga
+//     Alarm       : LED merah + board Alarm langsung dibunyikan lewat UDP
+//                   di WiFi yang sama (tanpa home hub)
 // - WiFi diatur lewat Bluetooth dari app iOS DapurSetup (SDK ESPProvision)
 // - Backend BeforeFire (MQTT): data sensor dikirim tiap 2 detik (dan langsung saat level bahaya atau orang berubah) untuk layar
 //   Monitor di app. Lihat KirimBackend.h.
@@ -221,8 +220,6 @@ Characteristic::OccupancyDetected      *hkOccupancy = nullptr;
 Characteristic::StatusFault            *hkOccFault  = nullptr;
 Characteristic::CurrentTemperature     *hkStove      = nullptr;
 Characteristic::StatusFault            *hkStoveFault = nullptr;
-Characteristic::ContactSensorState     *hkPeringatan = nullptr;   // Waspada 1 ke atas
-Characteristic::SmokeDetected          *hkBahaya     = nullptr;   // Alarm
 
 // LED: level bahaya didahulukan, selain itu biru saat ada orang.
 void perbaruiLed() {
@@ -746,23 +743,51 @@ void updateTermal() {
 
 // =====================================================
 // Fuzzy bahaya kompor
-// Dipanggil dari loop(): satu-satunya tempat HomeKit disentuh.
+// Dipanggil dari loop().
 // =====================================================
+// Mengisi field sensor DataTelemetri dari ringkasan global. Dipakai bersama oleh
+// telemetry (updateBackend) dan alert (aturBahaya).
+void isiSensor(DataTelemetri &d) {
+  d.adaBme = bsecOk && bmeTerakhirMs != 0 && millis() - bmeTerakhirMs < BME_HILANG_MS;
+  d.bmeRusak = !d.adaBme;
+  if (d.adaBme) {
+    d.suhuC      = bsecSuhu;
+    d.lembapRH   = bsecLembap;
+    d.tekananHPa = bsecTekanan;
+    d.iaq        = bsecIaq;
+    d.iaqAkurasi = bsecAkurasi;
+    d.eco2Ppm    = bsecCo2;
+  }
+
+  d.adaOrang   = presence != -1;
+  d.orang      = presence == 1;
+  d.radarRusak = !d.adaOrang;
+
+  bool termalSegar = mlxOk && !mlxWarned && mlxFrameTerakhir != 0;
+  d.adaKompor   = termalSegar;
+  d.termalRusak = !d.adaKompor;
+  d.komporC     = mlxKompor;
+}
+
 void aturBahaya(Condition c) {
   bahaya = c;
   Serial.printf("[%s] >>> BAHAYA KOMPOR: %s (skor %.1f, kompor %.1f C, IAQ %.0f, orang %s)\n",
                 penandaWaktu(), NAMA_BAHAYA[(int)c], fuzzySkor, mlxKompor, bsecIaq,
                 presenceText());
-  // Alert: contact sensor "terbuka" tampil sebagai status di Home app.
-  if (hkPeringatan) hkPeringatan->setVal(c != Condition::Normal ? 1 : 0);
-  // Puncak: smoke sensor -> notifikasi darurat + automation menyalakan Alarm.
-  if (hkBahaya)     hkBahaya->setVal(c == Condition::Alarm ? 1 : 0);
   perbaruiLed();
+
+  // Kirim alert ke backend supaya diteruskan ke APNs (app dapat notifikasi).
+  // Backend mengabaikannya kalau belum ada push token tersimpan.
+  DataTelemetri d;
+  isiSensor(d);
+  d.adaKondisi = true;
+  d.kondisi    = c;
+  d.skor       = fuzzySkor;
+  backendKirimAlert(d);
 }
 
 // @A: siarkan sinyal bahaya selama SINYAL_UJI_MS tanpa perlu kompor panas.
-// Hanya sinyal ke board Alarm; status HomeKit tidak disentuh, jadi tidak ada
-// notifikasi darurat palsu ke iPhone.
+// Hanya sinyal ke board Alarm; level bahaya ke backend tidak disentuh.
 #define SINYAL_UJI_MS 10000
 unsigned long ujiSinyalMulai = 0;
 bool          ujiSinyal      = false;
@@ -877,25 +902,7 @@ void updateBackend() {
   ruleIdTerkirim     = ruleId;
 
   DataTelemetri d;
-
-  d.adaBme = bmeSegar;
-  d.bmeRusak = !d.adaBme;
-  if (d.adaBme) {
-    d.suhuC      = bsecSuhu;
-    d.lembapRH   = bsecLembap;
-    d.tekananHPa = bsecTekanan;
-    d.iaq        = bsecIaq;
-    d.iaqAkurasi = bsecAkurasi;
-    d.eco2Ppm    = bsecCo2;
-  }
-
-  d.adaOrang   = presence != -1;
-  d.orang      = presence == 1;
-  d.radarRusak = !d.adaOrang;
-
-  d.adaKompor   = termalSegar;
-  d.termalRusak = !d.adaKompor;
-  d.komporC     = mlxKompor;
+  isiSensor(d);
 
   // fuzzySkor tetap NAN sampai evaluasi pertama, jadi level awal Normal belum
   // berarti aman. Tanpa kamera, fuzzy hanya menahan level terakhir: Normal
@@ -988,7 +995,7 @@ void cmdStatusTermal(const char *buf) {
 }
 
 // =====================================================
-// HomeKit: bridge + 7 accessory supaya tiap sensor punya tile sendiri di Home app
+// HomeKit: bridge + 5 accessory supaya tiap sensor punya tile sendiri di Home app
 // =====================================================
 void newAccessoryInfo(const char *name, const char *serial) {
   new SpanAccessory();
@@ -1044,20 +1051,6 @@ void setupHomeKit() {
     // dan ikut melebarkan pilihan ambang saat membuat automation.
     hkStove->setRange(KOMPOR_SUHU_MIN, KOMPOR_SUHU_MAX, 0.1);
     hkStoveFault = new Characteristic::StatusFault(0);
-
-  // Accessory 6: Stove Warning -- fuzzy Waspada 1 ke atas (alert).
-  // Contact sensor "terbuka" tampil di status Home app; notifikasinya bisa
-  // dinyalakan per accessory kalau peringatan dini juga mau dikirim ke iPhone.
-  newAccessoryInfo("Stove Warning", "A09-WARN");
-  new Service::ContactSensor();
-    hkPeringatan = new Characteristic::ContactSensorState(0);   // 0 = tertutup = aman
-
-  // Accessory 7: Stove Danger -- fuzzy Alarm (puncak bahaya).
-  // Smoke sensor dipilih karena iPhone otomatis mengirim notifikasi darurat
-  // untuknya. Board Alarm dibunyikan langsung lewat UDP (kirimSinyalAlarm).
-  newAccessoryInfo("Stove Danger", "A09-DANGER");
-  new Service::SmokeSensor();
-    hkBahaya = new Characteristic::SmokeDetected(0);
 
   // Kedua sensor masih dalam proses inisialisasi di task masing-masing.
   setBmeFault(1);

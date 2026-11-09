@@ -11,8 +11,10 @@
 // Hasil fuzzy ikut dikirim sebagai "condition" dan "score", supaya app bisa
 // menampilkan Safe / Unsafe / Dangerous.
 //
-// Yang belum ada di sini: alert (butuh push token) dan perintah dari app
-// (topic cmd/ack).
+// Sudah ada: status, telemetry, alert (dengan push token), dan perintah
+// register_push_token / unregister_push_token (topic cmd/ack). Perintah
+// `silence` belum diterapkan (butuh kontrol board Alarm) dan dibalas
+// unknown_action.
 //
 // Cara menyambungkan board ke backend:
 //   1. Di Mac:  scripts/mqtt-user.sh add <Serial> <PoP>   (keduanya ada di stiker)
@@ -76,6 +78,11 @@ bool backendTersambung();
 // Menaruh telemetri di antrean kirim tanpa menunggu jaringan, jadi aman
 // dipanggil dari loop() tanpa menahan HomeSpan. false kalau belum tersambung.
 bool backendKirimTelemetri(const DataTelemetri &d);
+
+// Dipanggil saat evaluateFuzzy() berganti kondisi. Mengirim alert ke backend
+// dengan semua push token yang tersimpan di NVS, supaya backend meneruskannya
+// ke APNs. false kalau belum tersambung atau belum ada push token.
+bool backendKirimAlert(const DataTelemetri &d);
 
 // Perintah Serial Monitor @M, dipasang lewat SpanUserCommand.
 void cmdBackend(const char *buf);

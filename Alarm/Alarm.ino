@@ -1,9 +1,10 @@
 // Tombol + Speaker + OLED di ESP32-C3 OLED (0.42"), terhubung ke Apple HomeKit lewat HomeSpan
-// - Tekan tombol -> alarm berbunyi (dua nada bergantian), tekan lagi -> alarm mati.
+// - Alarm HANYA bisa nyala dari sinyal board Sensor (ESP32-S3). Tombol dan
+//   Home app hanya bisa mematikan alarm, tidak bisa menyalakan.
 // - OLED menampilkan status alarm dan status tombol.
-// - HomeKit: satu accessory Switch "Alarm". Bisa dinyalakan dari Home app atau
-//   dari automation (mis. saat Stove Heat di board Sensor terlalu panas), dan
-//   ikut berubah saat tombol fisik ditekan.
+// - HomeKit: satu accessory Switch "Alarm". Ikut menyala saat Sensor memicu
+//   alarm; mematikannya dari Home app mematikan alarm. Permintaan nyala dari
+//   Home app ditolak.
 // - Board Sensor: saat fuzzy mencapai level Alarm, Sensor menyiarkan sinyal UDP
 //   di WiFi yang sama dan alarm langsung berbunyi, tanpa home hub. Dimatikan
 //   lewat tombol / Home app; tidak berbunyi lagi sampai ada kejadian bahaya baru.
@@ -39,7 +40,7 @@
 //      pilih WiFi, isi kata sandi.
 //   4. Board menyala ulang, lalu tambahkan di Apple Home memakai kode pairing
 //      yang tertera di stiker.
-//   Selama mode setup, tombol dan speaker tetap berfungsi sebagai alarm lokal.
+//   Selama mode setup belum ada WiFi, jadi alarm belum bisa dipicu Sensor.
 //
 // Perintah Serial Monitor (dari Bersama/SetupPerangkat.h, diawali @):
 //   @Q  cetak ulang stiker perangkat
@@ -64,11 +65,6 @@
 
 // Kontak tombol yang dipakai: false = NO, true = NC
 #define USE_NC           true
-
-// Jenis tombol:
-//   false = tombol biasa: tekan sekali = alarm nyala, tekan lagi = alarm mati
-//   true  = tombol terkunci (latching): alarm nyala selama tombol terkunci di posisi ditekan
-#define BUTTON_LATCHING  false
 
 // Nada alarm. Grove Speaker paling jelas di nada rendah, sesuaikan dengan hasil tes sweep.
 const uint32_t TONE_HIGH = 440;            // Hz
@@ -205,16 +201,15 @@ void updateOLED() {
 }
 
 // ---------- Alarm ----------
-// kabarkanHk = false saat perintah datang dari HomeKit sendiri, supaya nilainya
-// tidak dikirim balik ke Home app.
-void startAlarm(bool kabarkanHk = true) {
+// Hanya dipanggil dari layaniSinyalSensor(): alarm cuma bisa nyala dari Sensor.
+void startAlarm() {
   if (alarmOn) return;
   alarmOn = true;
   tonePhase = false;
   lastToneMs = millis();
   speakerTone(TONE_HIGH);
   Serial.printf("[%7.1f s] >>> ALARM NYALA\n", millis() / 1000.0);
-  if (kabarkanHk && hkAlarm && !modeSetup) hkAlarm->setVal(true);
+  if (hkAlarm && !modeSetup) hkAlarm->setVal(true);
   updateOLED();
 }
 
@@ -245,19 +240,16 @@ void updateAlarmTone() {
 void onButtonChange(bool pressed) {
   Serial.printf("[%7.1f s] Tombol %s\n", millis() / 1000.0, pressed ? "DITEKAN" : "DILEPAS");
 
-  if (BUTTON_LATCHING) {
-    if (pressed && !alarmOn) startAlarm();
-    else if (!pressed && alarmOn) stopAlarm();
-  } else if (pressed) {
+  // Tombol hanya mematikan alarm; menyalakan hanya lewat sinyal Sensor.
+  if (pressed) {
     pressCount++;
-    if (alarmOn) stopAlarm();
-    else startAlarm();
+    stopAlarm();
   }
   updateOLED();
 }
 
 // Debounce tombol + nada alarm. Dipanggil dari loop() dan juga dari loop
-// tunggu provisioning, supaya alarm lokal tetap jalan selama setup WiFi.
+// tunggu provisioning, supaya tombol tetap terbaca selama setup WiFi.
 void layaniTombolDanAlarm() {
   bool reading = readPressed();
   if (reading != lastReading) {
@@ -314,12 +306,13 @@ struct AlarmSwitch : Service::Switch {
 
   boolean update() override {
     if (hkAlarm->getNewVal()) {
-      Serial.printf("[%7.1f s] HomeKit meminta alarm NYALA\n", millis() / 1000.0);
-      startAlarm(false);
-    } else {
-      Serial.printf("[%7.1f s] HomeKit meminta alarm MATI\n", millis() / 1000.0);
-      stopAlarm(false);
+      // Alarm hanya boleh dinyalakan sinyal Sensor. false = ditolak, Home app
+      // mengembalikan switch ke posisi mati.
+      Serial.printf("[%7.1f s] HomeKit meminta alarm NYALA -> ditolak\n", millis() / 1000.0);
+      return false;
     }
+    Serial.printf("[%7.1f s] HomeKit meminta alarm MATI\n", millis() / 1000.0);
+    stopAlarm(false);
     return true;
   }
 };
@@ -327,8 +320,8 @@ struct AlarmSwitch : Service::Switch {
 // =====================================================
 // Provisioning WiFi lewat BLE + identitas HomeKit
 // Isinya ada di Bersama/SetupPerangkat.h, dipakai bersama board Sensor.
-// Di sini hanya bagian yang khas Alarm: tampilan OLED dan alarm lokal yang
-// tetap jalan selama setup WiFi.
+// Di sini hanya bagian yang khas Alarm: tampilan OLED dan tombol yang
+// tetap dilayani selama setup WiFi.
 // =====================================================
 void saatTahapProv(TahapProv tahap, const char *teks) {
   modeSetup = true;
@@ -341,7 +334,7 @@ const InfoPerangkat PERANGKAT = {
   HK_NAME, HK_HOSTNAME, HK_MODEL, HK_SETUP_ID, Category::Switches,
   "DAPUR_ALM_",            // nama BLE jadi DAPUR_ALM_xxxxxx (6 digit MAC)
   saatTahapProv,
-  layaniTombolDanAlarm,    // tombol dan speaker tetap dilayani selama setup WiFi
+  layaniTombolDanAlarm,    // tombol tetap dilayani selama setup WiFi
 };
 
 void setupHomeKit() {
@@ -375,9 +368,6 @@ void setup() {
   buttonState = lastReading = readPressed();
 
   setupHomeKit();   // juga mencetak stiker perangkat
-
-  // Tombol terkunci yang sudah dalam posisi ditekan saat menyala langsung memicu alarm
-  if (BUTTON_LATCHING && buttonState) startAlarm();
   updateOLED();
 }
 

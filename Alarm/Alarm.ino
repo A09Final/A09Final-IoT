@@ -1,13 +1,13 @@
 // Tombol + Speaker + OLED di ESP32-C3 OLED (0.42"), terhubung ke Apple HomeKit lewat HomeSpan
-// - Alarm HANYA bisa nyala dari sinyal board Sensor (ESP32-S3). Tombol dan
-//   Home app hanya bisa mematikan alarm, tidak bisa menyalakan.
+// - Alarm HANYA bisa nyala dari sinyal board Sensor (ESP32-S3), dan HANYA bisa
+//   dimatikan lewat tombol fisik.
 // - OLED menampilkan status alarm dan status tombol.
-// - HomeKit: satu accessory Switch "Alarm". Ikut menyala saat Sensor memicu
-//   alarm; mematikannya dari Home app mematikan alarm. Permintaan nyala dari
-//   Home app ditolak.
+// - HomeKit: satu Switch "Alarm" yang hanya menampilkan status; ditekan dari
+//   Home app tidak berpengaruh. Bisa dipakai sebagai pemicu automation di Home
+//   app, mis. nyalakan lampu atau putar suara di HomePod saat Alarm menyala.
 // - Board Sensor: saat fuzzy mencapai level Alarm, Sensor menyiarkan sinyal UDP
 //   di WiFi yang sama dan alarm langsung berbunyi, tanpa home hub. Dimatikan
-//   lewat tombol / Home app; tidak berbunyi lagi sampai ada kejadian bahaya baru.
+//   lewat tombol; tidak berbunyi lagi sampai ada kejadian bahaya baru.
 //   Uji dengan @A di Serial Monitor Sensor.
 // - WiFi diatur lewat Bluetooth dari app iOS DapurSetup (SDK ESPProvision),
 //   sama seperti board Sensor.
@@ -136,7 +136,7 @@ unsigned long lastReportMs = 0;
 bool modeSetup = false;
 const char *setupStatus = "Menunggu app";
 
-SpanCharacteristic *hkAlarm = nullptr;    // Characteristic::On milik Switch "Alarm"
+SpanCharacteristic *hkAlarm = nullptr;    // On milik Switch "Alarm": 1 = alarm berbunyi, 0 = mati
 
 // Sinyal bahaya dari board Sensor (lihat Bersama/SetupPerangkat.h).
 WiFiUDP udpBahaya;
@@ -209,11 +209,11 @@ void startAlarm() {
   lastToneMs = millis();
   speakerTone(TONE_HIGH);
   Serial.printf("[%7.1f s] >>> ALARM NYALA\n", millis() / 1000.0);
-  if (hkAlarm && !modeSetup) hkAlarm->setVal(true);
+  if (hkAlarm && !modeSetup) hkAlarm->setVal(1);
   updateOLED();
 }
 
-void stopAlarm(bool kabarkanHk = true) {
+void stopAlarm() {
   if (!alarmOn) return;
   alarmOn = false;
   // Sensor terus menyiarkan selama bahaya; tanpa ini alarm langsung berbunyi
@@ -221,7 +221,7 @@ void stopAlarm(bool kabarkanHk = true) {
   if (bahayaSensor) dibungkam = true;
   speakerTone(0);
   Serial.printf("[%7.1f s] >>> ALARM MATI\n", millis() / 1000.0);
-  if (kabarkanHk && hkAlarm && !modeSetup) hkAlarm->setVal(false);
+  if (hkAlarm && !modeSetup) hkAlarm->setVal(0);
   updateOLED();
 }
 
@@ -297,23 +297,20 @@ void layaniSinyalSensor() {
 }
 
 // =====================================================
-// HomeKit: Switch "Alarm"
+// HomeKit: Switch "Alarm" -- hanya menampilkan status
+// Ikut nyala/mati mengikuti alarm, jadi bisa dipakai sebagai pemicu automation
+// ("saat Alarm menyala"). Perintah dari Home app atau automation ditolak.
 // =====================================================
 struct AlarmSwitch : Service::Switch {
   AlarmSwitch() : Service::Switch() {
     hkAlarm = new Characteristic::On(false);
   }
 
+  // false = ditolak: alarm tidak berubah, switch di Home app kembali ke posisi semula.
   boolean update() override {
-    if (hkAlarm->getNewVal()) {
-      // Alarm hanya boleh dinyalakan sinyal Sensor. false = ditolak, Home app
-      // mengembalikan switch ke posisi mati.
-      Serial.printf("[%7.1f s] HomeKit meminta alarm NYALA -> ditolak\n", millis() / 1000.0);
-      return false;
-    }
-    Serial.printf("[%7.1f s] HomeKit meminta alarm MATI\n", millis() / 1000.0);
-    stopAlarm(false);
-    return true;
+    Serial.printf("[%7.1f s] HomeKit meminta alarm %s -> ditolak\n", millis() / 1000.0,
+                  hkAlarm->getNewVal() ? "NYALA" : "MATI");
+    return false;
   }
 };
 

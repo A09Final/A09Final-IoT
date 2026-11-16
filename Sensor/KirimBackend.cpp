@@ -13,15 +13,23 @@
 #include <ctype.h>
 #include <stdlib.h>
 
-// Alamat broker bawaan kalau belum pernah diatur lewat @M. Memakai nama .local
-// Mac yang menjalankan BeforeFire-Backend, karena nama itu tetap sama walaupun
-// IP Mac berganti. ESP32 mencari nama .local lewat mDNS
+// Alamat broker bawaan kalau belum pernah diatur lewat @M. Nama
+// beforefire-server.local diumumkan oleh scripts/start-server.sh di
+// BeforeFire-Backend, di Mac mana pun yang menjalankan server, dan ikut pindah
+// ke IP baru kalau Mac ganti WiFi. Jadi board tidak perlu diatur ulang saat
+// server pindah Mac atau WiFi. ESP32 mencari nama .local lewat mDNS
 // (CONFIG_LWIP_DNS_SUPPORT_MDNS_QUERIES di core ESP32).
-// Host-nya harus sama dengan SensorBackendConfiguration.defaultBackendAddress di app.
-// Ganti kalau server pindah ke Mac lain.
+// Host-nya harus sama dengan LOCAL_NAME di scripts/start-server.sh dan
+// SensorBackendConfiguration.defaultHost di app.
 #ifndef BACKEND_MQTT_URI
-  #define BACKEND_MQTT_URI "mqtt://Dericks-MacBook-Pro.local:1883"
+  #define BACKEND_MQTT_URI "mqtt://beforefire-server.local:1883"
 #endif
+
+// Host alamat bawaan versi lama, huruf kecil. Alamat @M yang memakai host ini
+// diganti ke HOST_BAWAAN saat boot (port tetap), supaya board yang dulu diatur
+// dengan nama Mac lama tidak perlu diatur ulang.
+#define HOST_BAWAAN_LAMA   "dericks-macbook-pro.local"
+#define HOST_BAWAAN        "beforefire-server.local"
 
 #define BACKEND_NVS        "a09backend"
 #define BACKEND_NVS_URI    "uri"
@@ -475,6 +483,21 @@ static void hentikanKlien() {
 // =====================================================
 // API untuk sketch
 // =====================================================
+// Mengganti host HOST_BAWAAN_LAMA di uri dengan HOST_BAWAAN. Skema dan port
+// tetap. Mengembalikan true kalau uri berubah.
+static bool gantiHostLama(String &uri) {
+  String kecil = uri;
+  kecil.toLowerCase();
+  const String lama = String("://") + HOST_BAWAAN_LAMA;
+  int awal = kecil.indexOf(lama);
+  if (awal < 0) return false;
+  int akhir = awal + lama.length();
+  // Hanya host yang persis sama: sesudahnya harus port, path, atau akhir teks.
+  if (akhir < (int)kecil.length() && kecil[akhir] != ':' && kecil[akhir] != '/') return false;
+  uri = uri.substring(0, awal + 3) + HOST_BAWAAN + uri.substring(akhir);
+  return true;
+}
+
 void backendMulai(const char *deviceId, const char *pop) {
   idAlat  = deviceId;
   popAlat = pop;
@@ -488,9 +511,13 @@ void backendMulai(const char *deviceId, const char *pop) {
 
   // Alamat dari @M menang atas bawaan; "@M off" menyimpan string kosong.
   Preferences pref;
-  pref.begin(BACKEND_NVS, true);
+  pref.begin(BACKEND_NVS, false);
   bool adaDiNvs = pref.isKey(BACKEND_NVS_URI);
   String tersimpan = adaDiNvs ? pref.getString(BACKEND_NVS_URI, "") : String(BACKEND_MQTT_URI);
+  if (adaDiNvs && gantiHostLama(tersimpan)) {
+    pref.putString(BACKEND_NVS_URI, tersimpan);
+    Serial.printf("[BACKEND] Alamat @M lama dipindah ke %s\n", tersimpan.c_str());
+  }
   pref.end();
   strlcpy(uriBroker, tersimpan.c_str(), sizeof(uriBroker));
 
@@ -684,6 +711,7 @@ bool backendKirimAlert(const DataTelemetri &d) {
 //   @M                       status koneksi
 //   @M mqtt://<host>:<port>  simpan alamat broker dan sambung ulang
 //   @M off                   matikan pengiriman ke backend
+//   @M default               hapus alamat @M, kembali ke BACKEND_MQTT_URI
 void cmdBackend(const char *buf) {
   const char *arg = buf + 1;              // buf diawali huruf perintahnya sendiri ('M')
   while (*arg == ' ') arg++;
@@ -705,25 +733,37 @@ void cmdBackend(const char *buf) {
   }
 
   char baru[sizeof(uriBroker)];
-  if (strcmp(arg, "off") == 0) {
+  if (strlen(arg) >= sizeof(baru)) {
+    Serial.println("[BACKEND] Alamat terlalu panjang.");
+    return;
+  }
+  strlcpy(baru, arg, sizeof(baru));
+  // Buang spasi atau CR yang ikut terketik di belakang.
+  for (int i = strlen(baru) - 1; i >= 0 && isspace((unsigned char)baru[i]); i--) baru[i] = '\0';
+
+  bool pakaiBawaan = strcmp(baru, "default") == 0;
+  if (pakaiBawaan) {
+    strlcpy(baru, BACKEND_MQTT_URI, sizeof(baru));
+  } else if (strcmp(baru, "off") == 0) {
     baru[0] = '\0';
-  } else if (strncmp(arg, "mqtt://", 7) == 0 && strlen(arg) < sizeof(baru)) {
-    strlcpy(baru, arg, sizeof(baru));
-    // Buang spasi atau CR yang ikut terketik di belakang.
-    for (int i = strlen(baru) - 1; i >= 0 && isspace((unsigned char)baru[i]); i--) baru[i] = '\0';
-  } else {
-    Serial.println("[BACKEND] Format: @M mqtt://<IP Mac>:1883   atau   @M off");
+  } else if (strncmp(baru, "mqtt://", 7) != 0) {
+    Serial.println("[BACKEND] Format: @M mqtt://<IP Mac>:1883   atau   @M default   atau   @M off");
     return;
   }
 
   Preferences pref;
   pref.begin(BACKEND_NVS, false);
-  pref.putString(BACKEND_NVS_URI, baru);
+  if (pakaiBawaan)
+    pref.remove(BACKEND_NVS_URI);   // tanpa kunci, boot berikutnya juga memakai bawaan
+  else
+    pref.putString(BACKEND_NVS_URI, baru);
   pref.end();
 
   hentikanKlien();
   strlcpy(uriBroker, baru, sizeof(uriBroker));
-  if (uriBroker[0])
+  if (pakaiBawaan)
+    Serial.printf("[BACKEND] Kembali ke alamat bawaan: %s\n", uriBroker);
+  else if (uriBroker[0])
     Serial.printf("[BACKEND] Alamat broker disimpan: %s\n", uriBroker);
   else
     Serial.println("[BACKEND] Pengiriman ke backend dimatikan.");

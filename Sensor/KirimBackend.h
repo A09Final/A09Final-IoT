@@ -26,7 +26,7 @@
 //   Alamat lain bisa diatur di Serial Monitor:  @M mqtt://<IP Mac>:1883
 //   (misalnya di WiFi yang memblokir nama .local). Alamat itu disimpan di NVS
 //   dan menggantikan alamat bawaan. "@M" saja menampilkan status, "@M off"
-//   mematikan pengiriman.
+//   mematikan pengiriman, "@M default" kembali ke alamat bawaan.
 //   Kalau PoP diganti dengan @R, daftarkan ulang board di langkah 1 memakai
 //   PoP baru; board otomatis login ulang dengan PoP itu.
 

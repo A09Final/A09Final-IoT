@@ -1014,7 +1014,7 @@ void setupHomeKit() {
   new SpanUserCommand('B', "- status BSEC + state kalibrasi di NVS", cmdStatusBsec);
   new SpanUserCommand('T', "- status kamera thermal + peta panas", cmdStatusTermal);
   new SpanUserCommand('A', "- uji: kirim sinyal bahaya ke board Alarm selama 10 detik", cmdUjiSinyal);
-  new SpanUserCommand('M', "- status backend; @M mqtt://<IP>:1883 | @M off", cmdBackend);
+  new SpanUserCommand('M', "- status backend; @M mqtt://<IP>:1883 | @M default | @M off", cmdBackend);
 
   // Accessory 0: bridge itu sendiri
   newAccessoryInfo(HK_NAME, "A09-BRIDGE");

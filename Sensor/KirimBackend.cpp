@@ -13,14 +13,16 @@
 #include <ctype.h>
 #include <stdlib.h>
 
-// Alamat broker bawaan kalau belum pernah diatur lewat @M. Memakai nama .local
-// Mac yang menjalankan BeforeFire-Backend, karena nama itu tetap sama walaupun
-// IP Mac berganti. ESP32 mencari nama .local lewat mDNS
+// Alamat broker bawaan kalau belum pernah diatur lewat @M. Nama
+// beforefire-server.local diumumkan oleh scripts/start-server.sh di
+// BeforeFire-Backend, di Mac mana pun yang menjalankan server, dan ikut pindah
+// ke IP baru kalau Mac ganti WiFi. Jadi board tidak perlu diatur ulang saat
+// server pindah Mac atau WiFi. ESP32 mencari nama .local lewat mDNS
 // (CONFIG_LWIP_DNS_SUPPORT_MDNS_QUERIES di core ESP32).
-// Host-nya harus sama dengan SensorBackendConfiguration.defaultBackendAddress di app.
-// Ganti kalau server pindah ke Mac lain.
+// Host-nya harus sama dengan LOCAL_NAME di scripts/start-server.sh dan
+// SensorBackendConfiguration.defaultHost di app.
 #ifndef BACKEND_MQTT_URI
-  #define BACKEND_MQTT_URI "mqtt://Dericks-MacBook-Pro.local:1883"
+  #define BACKEND_MQTT_URI "mqtt://beforefire-server.local:1883"
 #endif
 
 #define BACKEND_NVS        "a09backend"

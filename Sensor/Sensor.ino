@@ -49,7 +49,7 @@
 //   @B  status BSEC: akurasi, IAQ, dan state kalibrasi di NVS
 //   @T  status kamera thermal + peta panas untuk mengarahkan kamera ke kompor
 //   @A  uji: kirim sinyal bahaya ke board Alarm selama 10 detik
-//   @M  status backend; "@M mqtt://<IP Mac>:1883" mengganti alamat broker bawaan
+//   @M  status backend; "@M mqtt://<IP Mac>:1883" mengganti alamat broker bawaan (mqtt://beforefire-server.local:1883)
 //   Bawaan HomeSpan: ? bantuan | A provisioning ulang | X hapus WiFi | U hapus pairing
 
 #include <Arduino.h>

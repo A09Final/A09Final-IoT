@@ -264,6 +264,10 @@ FuzzyOutput evaluateFuzzy(const FuzzyInput& data) {
   // RULE 1–7: SUHU KOMPOR NORMAL
   // ==================================================
 
+  // Emisi memasak dapat menaikkan IAQ saat suhu kompor masih rendah.
+  // Pada rentang ini, IAQ dan ketidakhadiran saja tidak menaikkan level bahaya.
+  // Normal adalah hasil penilaian kompor, bukan pernyataan bahwa udara bersih.
+
   // Rule 1:
   // Stove Normal AND IAQ Excellent/Good -> Normal
   const RuleMatch rule1Match = andMatch(
@@ -281,7 +285,7 @@ FuzzyOutput evaluateFuzzy(const FuzzyInput& data) {
 
   // Rule 3:
   // Stove Normal AND IAQ Lightly Polluted
-  // AND orang tidak ada AND durasi Very Long -> Warning 1
+  // AND orang tidak ada AND durasi Very Long -> Normal
   const RuleMatch rule3Match = andMatch(
     andMatch(stoveNormalFuzzy, lightlyPollutedFuzzy),
     andMatch(presenceNotDetectedFuzzy, absenceVeryLongFuzzy)
@@ -297,7 +301,7 @@ FuzzyOutput evaluateFuzzy(const FuzzyInput& data) {
 
   // Rule 5:
   // Stove Normal AND IAQ Moderately Polluted
-  // AND orang tidak ada AND durasi Long/Very Long -> Warning 1
+  // AND orang tidak ada AND durasi Long/Very Long -> Normal
   const RuleMatch rule5Match = andMatch(
     andMatch(stoveNormalFuzzy, moderatelyPollutedFuzzy),
     andMatch(presenceNotDetectedFuzzy, absenceLongOrVeryLong)
@@ -313,7 +317,7 @@ FuzzyOutput evaluateFuzzy(const FuzzyInput& data) {
 
   // Rule 7:
   // Stove Normal AND IAQ Heavy/Severe/Extreme
-  // AND orang tidak ada -> Warning 1
+  // AND orang tidak ada -> Normal
   const RuleMatch rule7Match = andMatch(
     stoveNormalFuzzy,
     andMatch(iaqHeavyToExtreme, presenceNotDetectedFuzzy)
@@ -541,17 +545,17 @@ FuzzyOutput evaluateFuzzy(const FuzzyInput& data) {
   // Dukungan untuk Normal
   normalSupport.include(1, rule1Match);
   normalSupport.include(2, rule2Match);
+  normalSupport.include(3, rule3Match);
   normalSupport.include(4, rule4Match);
+  normalSupport.include(5, rule5Match);
   normalSupport.include(6, rule6Match);
+  normalSupport.include(7, rule7Match);
   normalSupport.include(8, rule8Match);
   normalSupport.include(11, rule11Match);
   normalSupport.include(18, rule18Match);
 
 
   // Dukungan untuk Warning 1
-  warning1Support.include(3, rule3Match);
-  warning1Support.include(5, rule5Match);
-  warning1Support.include(7, rule7Match);
   warning1Support.include(9, rule9Match);
   warning1Support.include(12, rule12Match);
   warning1Support.include(14, rule14Match);
